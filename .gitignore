@@ -1,0 +1,8 @@
+# Never commit user data or secrets
+credentials.json
+config.json
+health.json
+*.tmp
+__pycache__/
+*.pyc
+.DS_Store

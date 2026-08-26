@@ -1,0 +1,834 @@
+#!/usr/bin/env python3
+"""Multi-model council: fan a prompt out to several OpenAI-compatible endpoints in parallel.
+
+Stdlib only -- no venv, no pip.
+
+  council.py --list-models [--provider nvidia]   authoritative model IDs from the API
+  council.py --list-roles                        available review roles
+  council.py --set-key nvidia                    store a key (reads stdin, never argv)
+  council.py --configure                         write panelists from a JSON spec on stdin
+  council.py --show                              current panel
+  council.py --check                             liveness probe, ~1 token each
+  council.py --prompt-file PATH [--only a,b]     ask the panel
+
+Key resolution order: environment variable, then credentials.json (mode 0600).
+Keys are never written to config.json and never passed as command-line arguments.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import hashlib
+import stat
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+BUNDLED = HERE.parent / "defaults"          # ships with the plugin, read-only
+
+# User data lives outside the plugin so an upgrade never touches keys or config.
+COUNCIL_HOME = Path(os.environ.get("COUNCIL_HOME",
+                                   Path.home() / ".claude" / "council"))
+CONFIG_PATH = COUNCIL_HOME / "config.json"
+ROLES_PATH = COUNCIL_HOME / "roles.json"
+CREDS_PATH = COUNCIL_HOME / "credentials.json"
+HEALTH_PATH = COUNCIL_HOME / "health.json"
+
+# A panelist below this success rate (over at least MIN_ATTEMPTS) is reported
+# as unreliable and gets a swap recommendation.
+RELIABILITY_FLOOR = 0.80
+MIN_ATTEMPTS = 3
+
+# A panelist slower than this on average is unusable in practice even at a
+# 100% success rate -- success alone is not reliability.
+SLOW_SECONDS = 120
+
+# Substrings marking models that cannot serve as review panelists.
+NON_CHAT = ("embed", "rerank", "vision", "image", "ocr", "parse", "speech",
+            "translate", "guard", "safety", "reward", "vl-", "-vl", "omni")
+
+
+# --------------------------------------------------------------------------- io
+
+def ensure_home() -> None:
+    """Create the user data dir and seed a config on first run."""
+    COUNCIL_HOME.mkdir(parents=True, exist_ok=True)
+    if not CONFIG_PATH.exists():
+        example = BUNDLED / "config.example.json"
+        if example.exists():
+            CONFIG_PATH.write_text(example.read_text())
+            print(f"Created {CONFIG_PATH} from defaults. "
+                  f"Add a key with --set-key, then run --check.", file=sys.stderr)
+
+
+def load_json(path: Path, what: str) -> dict:
+    if not path.exists():
+        sys.exit(f"Missing {what}: {path}")
+    try:
+        with path.open() as fh:
+            return json.load(fh)
+    except json.JSONDecodeError as exc:
+        sys.exit(f"Malformed {what} ({path}): {exc}")
+
+
+def save_json(path: Path, data: dict, private: bool = False) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w") as fh:
+        json.dump(data, fh, indent=2)
+        fh.write("\n")
+    if private:
+        os.chmod(tmp, stat.S_IRUSR | stat.S_IWUSR)  # 0600 before it is visible
+    tmp.replace(path)
+
+
+def load_health() -> dict:
+    if not HEALTH_PATH.exists():
+        return {"panelists": {}}
+    try:
+        with HEALTH_PATH.open() as fh:
+            return json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return {"panelists": {}}
+
+
+def record_outcomes(results: list) -> None:
+    """Append run outcomes so --health can spot degrading panelists.
+
+    Best-effort: a failure to write health data must never break a review.
+    """
+    try:
+        health = load_health()
+        for r in results:
+            if r.get("error", "").startswith("no key"):
+                continue          # a missing key is config, not unreliability
+            entry = health["panelists"].setdefault(
+                r["name"], {"attempts": 0, "ok": 0, "errors": {},
+                            "latencies": [], "model": ""})
+            entry["attempts"] += 1
+            entry["model"] = r.get("model") or entry.get("model", "")
+            if r["ok"]:
+                entry["ok"] += 1
+                entry["latencies"] = (entry["latencies"] + [r["elapsed"]])[-20:]
+            else:
+                kind = classify_error(r.get("error", ""))
+                entry["errors"][kind] = entry["errors"].get(kind, 0) + 1
+                entry["last_error"] = r.get("error", "")[:200]
+        save_json(HEALTH_PATH, health)
+    except Exception:
+        pass
+
+
+def classify_error(err: str) -> str:
+    if "529" in err or "verloaded" in err:
+        return "overloaded"
+    if "timed out" in err or "timeout" in err.lower():
+        return "timeout"
+    if "410" in err or "end of life" in err:
+        return "retired"
+    if "404" in err:
+        return "not_found"
+    if "403" in err or "401" in err:
+        return "auth"
+    return "other"
+
+
+def load_creds() -> dict:
+    if not CREDS_PATH.exists():
+        return {}
+    mode = CREDS_PATH.stat().st_mode
+    if mode & (stat.S_IRWXG | stat.S_IRWXO):
+        print(f"WARNING: {CREDS_PATH} is group/world accessible. "
+              f"Fix with: chmod 600 {CREDS_PATH}", file=sys.stderr)
+    return load_json(CREDS_PATH, "credentials")
+
+
+# ------------------------------------------------------------------------ http
+
+def _request(url: str, api_key: str, timeout: int, payload: dict | None = None) -> dict:
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Accept": "application/json",
+    }
+    data = None
+    if payload is not None:
+        data = json.dumps(payload).encode()
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, headers=headers,
+                                 method="POST" if data else "GET")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode())
+
+
+# ---------------------------------------------------------------- panel wiring
+
+def provider_of(cfg: dict, panelist: dict) -> dict:
+    name = panelist.get("provider")
+    provider = cfg.get("providers", {}).get(name)
+    if not provider:
+        raise KeyError(f"panelist '{panelist['name']}' names unknown provider '{name}'")
+    return provider
+
+
+_KEYCHAIN_CACHE: dict[tuple[str, str], str | None] = {}
+
+
+def fingerprint(secret: str) -> str:
+    """Non-reversible 8-hex-char identity check. Never reveals key material."""
+    return hashlib.sha256(secret.encode()).hexdigest()[:8]
+
+
+def keychain_get(service: str, account: str | None = None) -> str | None:
+    """Read a secret from the macOS Keychain. Returns None if unavailable.
+
+    The value is piped straight into the HTTPS request -- it is never logged,
+    printed, or written to disk by this script.
+
+    Results are cached per (service, account) for the life of the process:
+    without this, --show spawns one blocking `security` subprocess per
+    panelist, serially, each with a 10s timeout.
+    """
+    if sys.platform != "darwin":
+        return None
+    cache_key = (service, account or os.environ.get("USER", ""))
+    if cache_key in _KEYCHAIN_CACHE:
+        return _KEYCHAIN_CACHE[cache_key]
+    try:
+        out = subprocess.run(
+            ["security", "find-generic-password",
+             "-a", account or os.environ.get("USER", ""), "-s", service, "-w"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        _KEYCHAIN_CACHE[cache_key] = None
+        return None
+    value = out.stdout.strip() if out.returncode == 0 else ""
+    _KEYCHAIN_CACHE[cache_key] = value or None
+    return value or None
+
+
+def resolve_key(provider: dict, creds: dict) -> str | None:
+    """Resolution order: environment, then Keychain, then credentials.json."""
+    env_var = provider["api_key_env"]
+    from_env = os.environ.get(env_var)
+    if from_env:
+        return from_env
+    service = provider.get("keychain_service")
+    if service:
+        from_keychain = keychain_get(service, provider.get("keychain_account"))
+        if from_keychain:
+            return from_keychain
+    return creds.get(env_var)
+
+
+def key_source(provider: dict, creds: dict) -> str:
+    """Where the key came from -- for --show. Never returns the key itself."""
+    env_var = provider["api_key_env"]
+    if os.environ.get(env_var):
+        return "env"
+    service = provider.get("keychain_service")
+    if service and keychain_get(service, provider.get("keychain_account")):
+        return "keychain"
+    if creds.get(env_var):
+        return "file"
+    return "NONE"
+
+
+def resolve_lens(roles: dict, panelist: dict) -> tuple[str, str]:
+    """Return (label, lens). An inline `lens` on the panelist wins over the role."""
+    if panelist.get("lens"):
+        return panelist.get("lens_label", "custom"), panelist["lens"]
+    key = panelist.get("role", "generalist")
+    role = roles["roles"].get(key)
+    if not role:
+        raise KeyError(f"panelist '{panelist['name']}' names unknown role '{key}'")
+    return role["label"], role["lens"]
+
+
+def ask(cfg: dict, roles: dict, creds: dict, panelist: dict,
+        prompt: str, timeout: int, max_tokens: int | None = None) -> dict:
+    """Query one panelist. Never raises -- failures come back as a result dict."""
+    name = panelist["name"]
+    started = time.monotonic()
+    try:
+        provider = provider_of(cfg, panelist)
+        label, lens = resolve_lens(roles, panelist)
+    except KeyError as exc:
+        return {"name": name, "ok": False, "error": str(exc)}
+
+    key = resolve_key(provider, creds)
+    if not key:
+        return {"name": name, "ok": False,
+                "error": f"no key: set ${provider['api_key_env']}, add keychain "
+                         f"item '{provider.get('keychain_service', '?')}', or run "
+                         f"--set-key {panelist['provider']}"}
+
+    payload = {
+        "model": panelist["model"],
+        "messages": [
+            {"role": "system", "content": lens},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": panelist.get("temperature", 0.2),
+        "max_tokens": max_tokens or panelist.get("max_tokens", 4096),
+        "stream": False,
+    }
+    if panelist.get("top_p") is not None:
+        payload["top_p"] = panelist["top_p"]
+    reserved = {"model", "messages", "stream"}
+    for k, v in (panelist.get("extra_body") or {}).items():
+        if k in reserved:
+            return {"name": name, "ok": False,
+                    "error": f"extra_body may not override '{k}' -- it would break "
+                             f"the request. Remove it from config.json."}
+        payload[k] = v
+
+    url = provider["base_url"].rstrip("/") + "/chat/completions"
+    try:
+        data = _request(url, key, panelist.get("timeout") or timeout, payload)
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode(errors="replace")[:400]
+        hint = ""
+        if exc.code == 404 and not detail.strip():
+            hint = (f"  (empty 404 on a {len(prompt)}-char prompt usually means the "
+                    f"payload exceeded this model's limit, not a bad model id -- "
+                    f"verify with --list-models, then shrink the prompt)")
+        elif exc.code == 529:
+            hint = "  (provider overloaded -- transient, retry)"
+        return {"name": name, "ok": False, "error": f"HTTP {exc.code}: {detail}{hint}"}
+    except Exception as exc:
+        extra = ""
+        if "timed out" in str(exc):
+            extra = (f"  (exceeded {panelist.get('timeout') or timeout}s -- raise "
+                     f"timeout_seconds, or set a per-panelist \"timeout\")")
+        return {"name": name, "ok": False,
+                "error": f"{type(exc).__name__}: {exc}{extra}"}
+
+    try:
+        msg = data["choices"][0]["message"]
+    except (KeyError, IndexError):
+        return {"name": name, "ok": False,
+                "error": f"unexpected response shape: {json.dumps(data)[:400]}"}
+
+    text = (msg.get("content") or "").strip()
+    reasoning = (msg.get("reasoning") or msg.get("reasoning_content") or "").strip()
+    if not text and reasoning:
+        text = reasoning  # some thinking models answer only in the reasoning channel
+
+    usage = data.get("usage") or {}
+    return {
+        "name": name, "ok": True, "model": panelist["model"], "label": label,
+        "text": text, "reasoning": reasoning if text != reasoning else "",
+        "elapsed": round(time.monotonic() - started, 1),
+        "tokens": usage.get("total_tokens"),
+    }
+
+
+def select_panel(cfg: dict, only: str | None) -> list[dict]:
+    panel = [p for p in cfg["panelists"] if p.get("enabled", True)]
+    if only:
+        wanted = {n.strip().lower() for n in only.split(",") if n.strip()}
+        panel = [p for p in panel if p["name"].lower() in wanted]
+        missing = wanted - {p["name"].lower() for p in panel}
+        if missing:
+            sys.exit(f"Unknown or disabled panelist(s): {', '.join(sorted(missing))}")
+    if not panel:
+        sys.exit("No enabled panelists. Run --configure.")
+    return panel
+
+
+# -------------------------------------------------------------------- commands
+
+def cmd_set_key(provider_name: str, cfg: dict) -> int:
+    provider = cfg.get("providers", {}).get(provider_name)
+    if not provider:
+        sys.exit(f"Unknown provider '{provider_name}'. "
+                 f"Known: {', '.join(cfg.get('providers', {}))}")
+    if sys.stdin.isatty():
+        print(f"Paste the key for '{provider_name}', then press Enter:", file=sys.stderr)
+        key = sys.stdin.readline().strip()   # Enter terminates; read() would need Ctrl-D
+    else:
+        key = sys.stdin.read().strip()
+    if not key:
+        sys.exit("No key read from stdin. (Nothing was pasted, or the paste "
+                 "did not register.)")
+    if any(c.isspace() for c in key):
+        sys.exit("Key contains whitespace -- the paste probably picked up extra "
+                 "characters. Not stored.")
+
+    creds = load_creds()
+    creds[provider["api_key_env"]] = key
+    save_json(CREDS_PATH, creds, private=True)
+    print(f"Stored under {provider['api_key_env']} in {CREDS_PATH} (mode 0600).")
+    print(f"Length {len(key)} chars, fingerprint {fingerprint(key)}. Verify with --check.")
+    return 0
+
+
+def cmd_list_models(cfg: dict, creds: dict, only_provider: str | None,
+                    timeout: int) -> int:
+    providers = cfg.get("providers", {})
+    if only_provider:
+        if only_provider not in providers:
+            sys.exit(f"Unknown provider '{only_provider}'.")
+        providers = {only_provider: providers[only_provider]}
+
+    for pname, provider in providers.items():
+        print(f"\n=== {pname}  {provider['base_url']} ===")
+        key = resolve_key(provider, creds)
+        if not key:
+            print(f"  SKIP: no key (set ${provider['api_key_env']} "
+                  f"or run --set-key {pname})")
+            continue
+        try:
+            data = _request(provider["base_url"].rstrip("/") + "/models", key, timeout)
+        except urllib.error.HTTPError as exc:
+            print(f"  ERROR HTTP {exc.code}: "
+                  f"{exc.read().decode(errors='replace')[:200]}")
+            continue
+        except Exception as exc:
+            print(f"  ERROR {type(exc).__name__}: {exc}")
+            continue
+        ids = sorted(m.get("id", "?") for m in data.get("data", []))
+        print(f"  {len(ids)} models")
+        for mid in ids:
+            print(f"    {mid}")
+    return 0
+
+
+def cmd_diagnose_key(cfg: dict, provider_name: str) -> int:
+    """Explain why a key does or does not resolve. Never prints the key."""
+    provider = cfg.get("providers", {}).get(provider_name)
+    if not provider:
+        sys.exit(f"Unknown provider '{provider_name}'.")
+
+    env_var = provider["api_key_env"]
+    service = provider.get("keychain_service")
+    user = provider.get("keychain_account") or os.environ.get("USER", "")
+    print(f"provider:  {provider_name}")
+    print(f"env var:   ${env_var}")
+    print(f"keychain:  service='{service}'  account='{user}'")
+    print()
+
+    val = os.environ.get(env_var)
+    print(f"[1] environment  {'SET (' + str(len(val)) + ' chars)' if val else 'unset'}")
+
+    print("[2] keychain")
+    if sys.platform != "darwin":
+        print("      skipped: not macOS")
+    elif not service:
+        print("      skipped: no keychain_service configured")
+    elif not user:
+        print("      FAIL: $USER is empty, cannot build the query")
+    else:
+        # Metadata lookup first (no -w) -- this never returns the secret.
+        meta = subprocess.run(
+            ["security", "find-generic-password", "-a", user, "-s", service],
+            capture_output=True, text=True, timeout=10)
+        if meta.returncode != 0:
+            print(f"      NOT FOUND (exit {meta.returncode})")
+            err = (meta.stderr or "").strip()
+            if err:
+                print(f"      {err}")
+            print("      Searching all accounts for this service name...")
+            any_acct = subprocess.run(
+                ["security", "find-generic-password", "-s", service],
+                capture_output=True, text=True, timeout=10)
+            if any_acct.returncode == 0:
+                for line in (any_acct.stdout or "").splitlines():
+                    if '"acct"' in line or '"svce"' in line:
+                        print(f"        {line.strip()}")
+                print("      -> item exists under a DIFFERENT account than "
+                      f"'{user}'. Fix the account or set keychain_account in config.")
+            else:
+                print(f"      -> no item with service '{service}' in any keychain.")
+        else:
+            print("      item found")
+            secret = subprocess.run(
+                ["security", "find-generic-password", "-a", user, "-s", service, "-w"],
+                capture_output=True, text=True, timeout=10)
+            if secret.returncode != 0:
+                print(f"      but read DENIED (exit {secret.returncode}): "
+                      f"{(secret.stderr or '').strip()}")
+            else:
+                v = secret.stdout.strip()
+                if not v:
+                    print("      readable but EMPTY -- the item was created without a "
+                          "value. Delete and re-add it.")
+                else:
+                    print(f"      readable: {len(v)} chars, "
+                          f"fingerprint {fingerprint(v)}")
+                    if v != v.strip() or "\n" in v:
+                        print("      WARNING: value contains whitespace/newlines; "
+                              "this will cause 401s.")
+
+    print("[3] credentials.json")
+    creds = load_creds()
+    if env_var in creds:
+        print(f"      SET ({len(creds[env_var])} chars)")
+    else:
+        print(f"      not present")
+    return 0
+
+
+def cmd_health(cfg: dict, creds: dict, timeout: int) -> int:
+    """Reliability per panelist, with a swap recommendation for weak ones."""
+    health = load_health()
+    stats = health.get("panelists", {})
+    if not stats:
+        print("No history yet. Run --check or a review first.")
+        return 0
+
+    print(f"{'PANELIST':<12} {'RUNS':>5} {'OK':>5} {'RATE':>6} {'AVG':>7}  ISSUES")
+    weak = []
+    for pl in cfg["panelists"]:
+        name = pl["name"]
+        s = stats.get(name)
+        if not s or not s["attempts"]:
+            print(f"{name:<12} {'-':>5} {'-':>5} {'-':>6} {'-':>7}  no data")
+            continue
+        rate = s["ok"] / s["attempts"]
+        lat = s["latencies"]
+        avg = f"{sum(lat)/len(lat):.1f}s" if lat else "-"
+        issues = ", ".join(f"{k}x{v}" for k, v in sorted(s["errors"].items())) or "-"
+        flag = ""
+        avg_s = sum(lat) / len(lat) if lat else 0.0
+        if s["attempts"] >= MIN_ATTEMPTS and rate < RELIABILITY_FLOOR:
+            flag = "  <-- UNRELIABLE"
+            weak.append((name, pl, rate, s, "failures"))
+        elif lat and avg_s > SLOW_SECONDS:
+            flag = "  <-- TOO SLOW"
+            weak.append((name, pl, rate, s, "slow"))
+        print(f"{name:<12} {s['attempts']:>5} {s['ok']:>5} {rate*100:>5.0f}% "
+              f"{avg:>7}  {issues}{flag}")
+
+    if not weak:
+        print("\nAll panelists within tolerance.")
+        return 0
+
+    print(f"\n{'=' * 68}\nRECOMMENDATION\n{'=' * 68}")
+    for name, pl, rate, s, why in weak:
+        if why == "slow":
+            lat = s["latencies"]
+            avg_s = sum(lat) / len(lat)
+            print(f"\n'{name}' ({pl['model']}) answers, but averages "
+                  f"{avg_s:.0f}s over {len(lat)} runs -- above the {SLOW_SECONDS}s "
+                  f"usable threshold.")
+            print("  A panel is only as fast as its slowest member; this one sets "
+                  "your whole review latency.")
+            if pl.get("extra_body"):
+                print("  It runs with extra_body reasoning options. Try lowering "
+                      "reasoning_effort before swapping the model out.")
+            print(f"  Find faster alternatives:  council.py --suggest-swap {name}")
+            continue
+        top = max(s["errors"], key=s["errors"].get) if s["errors"] else "unknown"
+        print(f"\n'{name}' ({pl['model']}) succeeded {rate*100:.0f}% of "
+              f"{s['attempts']} runs. Dominant failure: {top}.")
+        if top == "overloaded":
+            print("  Provider capacity, not your config. It may recover -- but if the "
+                  "panel needs to be dependable, swap it.")
+        elif top == "timeout":
+            print("  Raise its \"timeout\" in config.json, or swap for a faster model.")
+        elif top == "retired":
+            print("  This model is gone. It MUST be replaced.")
+        elif top == "auth":
+            print("  Key problem, not the model. Run --diagnose-key.")
+        print(f"  Find replacements:  council.py --suggest-swap {name}")
+    return 1
+
+
+def cmd_suggest_swap(cfg: dict, creds: dict, name: str, timeout: int) -> int:
+    """Probe alternative models for a panelist and rank them by measured latency."""
+    target = next((p for p in cfg["panelists"] if p["name"] == name), None)
+    if not target:
+        sys.exit(f"No panelist named '{name}'.")
+    provider = provider_of(cfg, target)
+    key = resolve_key(provider, creds)
+    if not key:
+        sys.exit(f"No key for provider '{target['provider']}'.")
+
+    print(f"Current: {name} -> {target['model']} (role: {target.get('role','custom')})")
+    print("Fetching catalog...")
+    try:
+        data = _request(provider["base_url"].rstrip("/") + "/models", key, timeout)
+    except Exception as exc:
+        sys.exit(f"Could not list models: {exc}")
+
+    in_use = {p["model"] for p in cfg["panelists"]}
+    health = load_health()
+    dead = set(health.get("unavailable", []))
+
+    cands = [m["id"] for m in data.get("data", [])
+             if not any(t in m["id"].lower() for t in NON_CHAT)
+             and m["id"] not in in_use and m["id"] not in dead]
+
+    # The catalog lists models the gateway does not actually serve -- they 404
+    # with "Function not found". Probing is the only way to know, so bias the
+    # sample toward models that look current and away from the long tail of
+    # older ones, then remember whatever turns out to be dead.
+    seated_vendors = {m.split("/")[0] for m in in_use if "/" in m}
+    MODERN = ("nemotron-3", "kimi", "deepseek", "minimax", "qwen3", "gpt-oss",
+              "llama-4", "mistral-large", "glm", "phi-4", "granite-3")
+
+    def rank(mid: str) -> tuple:
+        low = mid.lower()
+        return (
+            0 if any(t in low for t in MODERN) else 1,   # current-generation first
+            0 if mid.split("/")[0] not in seated_vendors else 1,  # vendor diversity
+            mid,
+        )
+
+    cands.sort(key=rank)
+    cands = cands[:16]
+    if not cands:
+        sys.exit("No candidate models found.")
+    if dead:
+        print(f"(skipping {len(dead)} models known to be unavailable)")
+
+    print(f"Probing {len(cands)} candidates (~10 tokens each)...\n")
+    probe = "Reply with: ok"
+    results = []
+    with ThreadPoolExecutor(max_workers=min(len(cands), 6)) as pool:
+        futs = {pool.submit(ask, cfg, {"roles": {}}, creds,
+                            {**target, "name": mid, "model": mid,
+                             "lens": "You are a test probe.", "lens_label": "probe"},
+                            probe, 60, 8): mid for mid in cands}
+        for f in as_completed(futs):
+            results.append(f.result())
+
+    ok = sorted([r for r in results if r["ok"]], key=lambda r: r["elapsed"])
+    bad = [r for r in results if not r["ok"]]
+    for r in ok:
+        vendor = r["model"].split("/")[0]
+        note = "  (new vendor)" if vendor not in seated_vendors else ""
+        print(f"  OK    {r['elapsed']:>6.1f}s  {r['model']}{note}")
+    for r in bad:
+        print(f"  FAIL          -  {r['name']}: {r['error'][:80]}")
+
+    # Persist the dead ones so later runs do not pay for them again.
+    newly_dead = [r["name"] for r in bad if "404" in r.get("error", "")]
+    if newly_dead:
+        health.setdefault("unavailable", [])
+        health["unavailable"] = sorted(set(health["unavailable"]) | set(newly_dead))
+        save_json(HEALTH_PATH, health)
+        print(f"\n  ({len(newly_dead)} catalogued but not served -- recorded, "
+              f"will be skipped next time)")
+
+    if not ok:
+        print("\nNo working replacement found in this sample. Re-run to probe "
+              "further into the catalog -- dead models are now skipped.")
+        return 1
+
+    if ok:
+        best = ok[0]
+        print(f"\nSuggested replacement: {best['model']} ({best['elapsed']}s)")
+        print("Apply with:\n")
+        newpl = [dict(p) for p in cfg["panelists"]]
+        for p in newpl:
+            if p["name"] == name:
+                p["model"] = best["model"]
+                p.pop("extra_body", None)   # model-specific; may not apply
+        print("  echo '" + json.dumps({"panelists": newpl}) +
+              "' | council.py --configure")
+    return 0
+
+
+def cmd_list_roles(roles: dict) -> int:
+    for key, role in roles["roles"].items():
+        print(f"\n{key}  [{role['label']}]")
+        print(f"  {role['lens'][:160]}...")
+    return 0
+
+
+def cmd_show(cfg: dict, roles: dict, creds: dict) -> int:
+    print(f"{'PANELIST':<12} {'PROVIDER':<10} {'ROLE':<16} {'KEY':<9} MODEL")
+    for p in cfg["panelists"]:
+        try:
+            provider = provider_of(cfg, p)
+            has_key = key_source(provider, creds)
+        except KeyError:
+            has_key = "?"
+        state = "" if p.get("enabled", True) else "  (disabled)"
+        role = p.get("role", "-") if not p.get("lens") else "custom"
+        print(f"{p['name']:<12} {p.get('provider','?'):<10} {role:<16} "
+              f"{has_key:<9} {p['model']}{state}")
+    _ = roles
+    return 0
+
+
+def cmd_configure(cfg: dict, roles: dict) -> int:
+    """Read {"panelists":[...]} from stdin and replace the panel.
+
+    Each entry needs: name, provider, model, role. Optional: extra_body,
+    temperature, top_p, max_tokens, enabled.
+    """
+    try:
+        spec = json.load(sys.stdin)
+    except json.JSONDecodeError as exc:
+        sys.exit(f"Malformed JSON on stdin: {exc}")
+
+    panelists = spec.get("panelists")
+    if not isinstance(panelists, list) or not panelists:
+        sys.exit('Expected {"panelists": [ ... ]} with at least one entry.')
+
+    known_providers = set(cfg.get("providers", {}))
+    known_roles = set(roles["roles"])
+    seen_names: set[str] = set()
+    errors: list[str] = []
+
+    for i, p in enumerate(panelists):
+        if not isinstance(p, dict):
+            errors.append(f"panelist[{i}]: must be a JSON object, got "
+                          f"{type(p).__name__}")
+            continue
+        for field in ("name", "provider", "model"):
+            if not p.get(field):
+                errors.append(f"panelist[{i}]: missing '{field}'")
+        name = p.get("name", f"[{i}]")
+        if name in seen_names:
+            errors.append(f"duplicate panelist name '{name}'")
+        seen_names.add(name)
+        if p.get("provider") and p["provider"] not in known_providers:
+            errors.append(f"{name}: unknown provider '{p['provider']}' "
+                          f"(known: {', '.join(sorted(known_providers))})")
+        role = p.get("role")
+        if role and role not in known_roles and not p.get("lens"):
+            errors.append(f"{name}: unknown role '{role}' "
+                          f"(known: {', '.join(sorted(known_roles))})")
+    if errors:
+        for e in errors:
+            print(f"  {e}", file=sys.stderr)
+        sys.exit(f"{len(errors)} problem(s); config not written.")
+
+    if len(panelists) > 8:
+        print(f"NOTE: {len(panelists)} panelists. Beyond ~5 the synthesis gets noisy "
+              f"and cost scales linearly.", file=sys.stderr)
+
+    cfg["panelists"] = panelists
+    save_json(CONFIG_PATH, cfg)
+    print(f"Wrote {len(panelists)} panelists to {CONFIG_PATH}:")
+    for p in panelists:
+        print(f"  {p['name']:<12} {p.get('role','custom'):<16} {p['model']}")
+    return 0
+
+
+def cmd_check(cfg: dict, roles: dict, creds: dict, panel: list[dict],
+              timeout: int) -> int:
+    failures = 0
+    with ThreadPoolExecutor(max_workers=min(len(panel), 8)) as pool:
+        futures = {pool.submit(ask, cfg, roles, creds, p, "Reply with: ok",
+                               timeout, max_tokens=8): p for p in panel}
+        results = [f.result() for f in as_completed(futures)]
+    record_outcomes(results)
+    for r in sorted(results, key=lambda r: r["name"]):
+        if r["ok"]:
+            print(f"  PASS  {r['name']:<12} {r['model']}  ({r['elapsed']}s)")
+        else:
+            failures += 1
+            print(f"  FAIL  {r['name']:<12} {r['error']}")
+    print(f"\n{len(results) - failures}/{len(results)} reachable")
+    return 1 if failures else 0
+
+
+def cmd_ask(cfg: dict, roles: dict, creds: dict, panel: list[dict],
+            prompt: str, timeout: int) -> int:
+    with ThreadPoolExecutor(max_workers=min(len(panel), 8)) as pool:
+        futures = [pool.submit(ask, cfg, roles, creds, p, prompt, timeout)
+                   for p in panel]
+        results = [f.result() for f in as_completed(futures)]
+
+    record_outcomes(results)
+    order = {p["name"]: i for i, p in enumerate(panel)}
+    results.sort(key=lambda r: order.get(r["name"], 999))
+    ok = [r for r in results if r["ok"]]
+    bad = [r for r in results if not r["ok"]]
+
+    for r in ok:
+        print(f"\n{'=' * 72}\nPANELIST: {r['name']}  [{r['label']}]\n"
+              f"model: {r['model']}   elapsed: {r['elapsed']}s   "
+              f"tokens: {r['tokens']}\n{'=' * 72}")
+        print(r["text"] or "(empty response)")
+
+    if bad:
+        print(f"\n{'=' * 72}\nUNAVAILABLE ({len(bad)})\n{'=' * 72}")
+        for r in bad:
+            print(f"  {r['name']}: {r['error']}")
+
+    print(f"\n--- {len(ok)}/{len(results)} panelists responded ---")
+    return 0 if ok else 1
+
+
+# ------------------------------------------------------------------------ main
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Multi-model council")
+    ap.add_argument("--prompt-file")
+    ap.add_argument("--prompt")
+    ap.add_argument("--only", help="comma-separated panelist names")
+    ap.add_argument("--provider", help="restrict --list-models to one provider")
+    ap.add_argument("--list-models", action="store_true")
+    ap.add_argument("--list-roles", action="store_true")
+    ap.add_argument("--set-key", metavar="PROVIDER")
+    ap.add_argument("--configure", action="store_true",
+                    help="read a panelist spec as JSON on stdin")
+    ap.add_argument("--show", action="store_true")
+    ap.add_argument("--diagnose-key", metavar="PROVIDER",
+                    help="explain why a key does or does not resolve")
+    ap.add_argument("--check", action="store_true")
+    ap.add_argument("--health", action="store_true",
+                    help="reliability per panelist + swap recommendations")
+    ap.add_argument("--suggest-swap", metavar="PANELIST",
+                    help="probe replacement models for a panelist")
+    args = ap.parse_args()
+
+    ensure_home()
+    cfg = load_json(CONFIG_PATH, "config")
+    roles = load_json(ROLES_PATH if ROLES_PATH.exists() else BUNDLED / "roles.json",
+                      "roles")
+    timeout = cfg.get("timeout_seconds", 180)
+
+    if args.list_roles:
+        return cmd_list_roles(roles)
+    if args.set_key:
+        return cmd_set_key(args.set_key, cfg)
+    if args.configure:
+        return cmd_configure(cfg, roles)
+    if args.diagnose_key:
+        return cmd_diagnose_key(cfg, args.diagnose_key)
+
+    creds = load_creds()
+
+    if args.list_models:
+        return cmd_list_models(cfg, creds, args.provider, timeout)
+    if args.show:
+        return cmd_show(cfg, roles, creds)
+    if args.health:
+        return cmd_health(cfg, creds, timeout)
+    if args.suggest_swap:
+        return cmd_suggest_swap(cfg, creds, args.suggest_swap, timeout)
+
+    panel = select_panel(cfg, args.only)
+    if args.check:
+        return cmd_check(cfg, roles, creds, panel, timeout)
+
+    if args.prompt_file:
+        try:
+            prompt = Path(args.prompt_file).read_text()
+        except OSError as exc:
+            sys.exit(f"Cannot read prompt file: {exc}")
+    elif args.prompt:
+        prompt = args.prompt
+    else:
+        prompt = sys.stdin.read()
+    if not prompt.strip():
+        sys.exit("Empty prompt.")
+    return cmd_ask(cfg, roles, creds, panel, prompt, timeout)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

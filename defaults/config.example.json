@@ -1,0 +1,69 @@
+{
+  "timeout_seconds": 600,
+  "_comment": "Keys are NOT stored here. Resolution order: environment variable named in api_key_env, then macOS Keychain item named in keychain_service, then credentials.json (mode 0600). Confirm model IDs with --list-models; providers retire models often.",
+  "providers": {
+    "nvidia": {
+      "base_url": "https://integrate.api.nvidia.com/v1",
+      "api_key_env": "NVIDIA_API_KEY",
+      "_signup": "https://build.nvidia.com -- one account-level key works for every model in the catalog",
+      "keychain_service": "nvidia-api-key"
+    },
+    "openai": {
+      "base_url": "https://api.openai.com/v1",
+      "api_key_env": "OPENAI_API_KEY",
+      "_signup": "https://platform.openai.com/api-keys",
+      "keychain_service": "openai-api-key"
+    }
+  },
+  "panelists": [
+    {
+      "name": "gpt",
+      "provider": "openai",
+      "model": "gpt-5.2",
+      "role": "correctness",
+      "enabled": true
+    },
+    {
+      "name": "deepseek",
+      "provider": "nvidia",
+      "model": "deepseek-ai/deepseek-v4-flash-0731",
+      "role": "architecture",
+      "enabled": true,
+      "temperature": 0.2,
+      "top_p": 0.95,
+      "max_tokens": 16384,
+      "timeout": 900,
+      "extra_body": {
+        "chat_template_kwargs": {
+          "thinking": true,
+          "reasoning_effort": "high"
+        }
+      }
+    },
+    {
+      "name": "kimi",
+      "provider": "nvidia",
+      "model": "moonshotai/kimi-k3",
+      "role": "security",
+      "enabled": true,
+      "max_tokens": 8192
+    },
+    {
+      "name": "nemotron",
+      "provider": "nvidia",
+      "model": "nvidia/nemotron-3-ultra-550b-a55b",
+      "role": "regression",
+      "enabled": true,
+      "max_tokens": 8192,
+      "timeout": 900
+    },
+    {
+      "name": "minimax",
+      "provider": "nvidia",
+      "model": "minimaxai/minimax-m3",
+      "role": "performance",
+      "enabled": true,
+      "max_tokens": 8192
+    }
+  ]
+}

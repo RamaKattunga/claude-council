@@ -1,0 +1,11 @@
+{
+  "name": "claude-council-marketplace",
+  "owner": {"name": "Rama Kattunga"},
+  "plugins": [
+    {
+      "name": "claude-council",
+      "source": "./",
+      "description": "Cross-vendor multi-model code review via any OpenAI-compatible endpoint."
+    }
+  ]
+}
