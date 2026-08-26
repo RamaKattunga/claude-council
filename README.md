@@ -18,7 +18,7 @@ your filesystem, none of the sandboxing those plugins need applies here.
 ## Install
 
 ```
-/plugin marketplace add <owner>/claude-council
+/plugin marketplace add RamaKattunga/claude-council
 /plugin install claude-council@claude-council-marketplace
 ```
 
