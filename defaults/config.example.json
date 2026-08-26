@@ -1,6 +1,6 @@
 {
   "timeout_seconds": 600,
-  "_comment": "Keys are NOT stored here. Resolution order: environment variable named in api_key_env, then macOS Keychain item named in keychain_service, then credentials.json (mode 0600). Confirm model IDs with --list-models; providers retire models often.",
+  "_comment": "Keys are NOT stored here. Resolution order: environment variable named in api_key_env, then macOS Keychain item named in keychain_service, then credentials.json (mode 0600). These model IDs are a STARTING POINT, not a guarantee -- the catalog lists models the gateway does not serve. Always run --check after install, and --list-models to find live ones.",
   "providers": {
     "nvidia": {
       "base_url": "https://integrate.api.nvidia.com/v1",
@@ -24,21 +24,13 @@
       "enabled": true
     },
     {
-      "name": "deepseek",
+      "name": "gptoss",
       "provider": "nvidia",
-      "model": "deepseek-ai/deepseek-v4-flash-0731",
+      "model": "openai/gpt-oss-120b",
       "role": "architecture",
       "enabled": true,
-      "temperature": 0.2,
-      "top_p": 0.95,
-      "max_tokens": 16384,
-      "timeout": 900,
-      "extra_body": {
-        "chat_template_kwargs": {
-          "thinking": true,
-          "reasoning_effort": "high"
-        }
-      }
+      "max_tokens": 8192,
+      "timeout": 300
     },
     {
       "name": "kimi",
