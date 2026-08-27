@@ -110,6 +110,34 @@ models are cached so they're skipped next time.
 - stops after 30 minutes idle
 - keys may be submitted but are **never** returned — only SHA-256 fingerprints leave the server
 
+## Independence, not headcount
+
+The value of a panel is decorrelated blind spots, not five opinions. Two models sharing a
+base or overlapping training data miss the same bug in the same way and then agree with each
+other — and that agreement reads as consensus when it is one perspective counted twice. A
+panel is therefore most confidently wrong exactly where its members are most alike, which is
+the opposite of what a review is for.
+
+This happened here. `gpt-oss` and `nemotron` independently asserted that `except Exception`
+catches `KeyboardInterrupt`. It does not. Two votes, one error, and naive majority logic
+would have promoted it to a finding.
+
+So `--show` and every review print a **CORRELATED PANELISTS** block, and the synthesis
+instructions count independent lineages rather than seats:
+
+```
+5 independent lineage(s) across 6 enabled panelist(s)
+
+CORRELATED PANELISTS — agreement between these is one perspective, not two:
+  openai: gpt, gptoss
+```
+
+Lineage is derived from the model's vendor prefix, or set explicitly with `"lineage"` on a
+panelist. **It is a proxy, not ground truth** — published lineage says nothing about data
+overlap or distillation between labs, so it separates the cases we can see and stays silent
+about the ones we cannot. Seat five different vendors and you are probably fine; seat two
+models from one lab and you are definitely not.
+
 ## Roles
 
 Nine ship by default: `correctness`, `architecture`, `security`, `regression`, `performance`,

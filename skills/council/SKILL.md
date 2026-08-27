@@ -92,7 +92,9 @@ Subset: `--only kimi,deepseek`
 
 **3. Synthesize — do not dump raw panelist output at the user.** Produce:
 
-- **Consensus** — flagged by 2+ panelists. Highest confidence. Lead with it.
+- **Consensus** — flagged by 2+ panelists **of different lineage**. Lead with it.
+  Same-lineage agreement is one perspective counted twice, not corroboration. The runner
+  prints which panelists are correlated; collapse them before counting.
 - **Divergence** — one panelist only. Say who, and why it may be a false positive.
 - **Contradiction** — panelists disagree. State it explicitly; do not paper over it.
 - **My read** — where I agree and where I don't, with reasoning. I am not a vote counter.

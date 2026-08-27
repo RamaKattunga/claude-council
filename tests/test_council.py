@@ -195,6 +195,55 @@ class SecretPreflightTests(unittest.TestCase):
         self.assertNotIn("AKIAIOSFODNN7EXAMPLE", r.stdout + r.stderr)
 
 
+class LineageTests(unittest.TestCase):
+    """A panel's value is decorrelated blind spots, not headcount. Same-lineage
+    panelists miss the same bug the same way and then agree, which naive
+    majority logic promotes -- so the panel is most confidently wrong exactly
+    where it is least informative."""
+
+    def setUp(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("council", SCRIPT)
+        self.m = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.m)
+
+    def test_lineage_comes_from_the_vendor_prefix(self):
+        self.assertEqual(
+            self.m.lineage_of({"model": "openai/gpt-oss-120b"}), "openai")
+        self.assertEqual(
+            self.m.lineage_of({"model": "deepseek-ai/deepseek-v4-pro"}), "deepseek-ai")
+
+    def test_a_direct_model_falls_back_to_its_provider(self):
+        self.assertEqual(
+            self.m.lineage_of({"model": "gpt-5.2", "provider": "openai"}), "openai")
+
+    def test_an_explicit_lineage_overrides_the_prefix(self):
+        """Vendor prefix is a proxy. A operator who knows two models share a
+        base must be able to say so."""
+        self.assertEqual(
+            self.m.lineage_of({"model": "someco/llama-derived", "lineage": "meta"}),
+            "meta")
+
+    def test_two_openai_models_collapse_to_one_vote(self):
+        """The exact flaw that shipped in the default panel: gpt-5.2 and
+        gpt-oss-120b are both OpenAI lineage, so six seats were five
+        perspectives."""
+        panel = [
+            {"name": "gpt", "model": "gpt-5.2", "provider": "openai"},
+            {"name": "gptoss", "model": "openai/gpt-oss-120b", "provider": "nvidia"},
+            {"name": "kimi", "model": "moonshotai/kimi-k3", "provider": "nvidia"},
+        ]
+        self.assertEqual(self.m.collapsed_vote_count(panel), 2)
+        self.assertEqual(sorted(self.m.lineage_groups(panel)["openai"]),
+                         ["gpt", "gptoss"])
+
+    def test_a_fully_diverse_panel_collapses_to_nothing(self):
+        panel = [{"name": n, "model": f"{v}/m", "provider": "nvidia"}
+                 for n, v in [("a", "deepseek-ai"), ("b", "moonshotai"),
+                              ("c", "nvidia"), ("d", "minimaxai")]]
+        self.assertEqual(self.m.collapsed_vote_count(panel), 4)
+
+
 class PolicyHookTests(unittest.TestCase):
     """The regex scan catches credential shapes. It cannot recognise a
     proprietary algorithm or an unreleased strategy, and that class of exposure

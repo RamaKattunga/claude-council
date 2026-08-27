@@ -37,7 +37,16 @@ in 15. This step is not optional - passing on an unverified finding is worse tha
 
 **5. Synthesize.** Never dump raw panelist output at the user. Produce:
 
-- **Consensus** - flagged by 2+ panelists. Lead with it.
+- **Consensus** - flagged by 2+ panelists **of different lineage**. Lead with it.
+
+  Count independent perspectives, not seats. The runner prints a CORRELATED PANELISTS block
+  when two panelists share a lineage; agreement between those is ONE vote, not two. Models
+  sharing a base or overlapping training data miss the same bug the same way and then agree
+  with each other, so a panel is most confidently wrong exactly where its members are most
+  alike. Promoting that agreement inverts the point of the review.
+
+  Observed here: gpt-oss and nemotron independently asserted `except Exception` catches
+  KeyboardInterrupt. It does not. Two votes, one error.
 - **Divergence** - one panelist only. Say who, and why it may be a false positive.
 - **Contradiction** - panelists disagree. State it; do not paper over it.
 - **My read** - where I agree and where I don't, with reasoning. I am not a vote counter.

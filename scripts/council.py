@@ -348,6 +348,46 @@ def _post_chat(url: str, api_key: str, payload: dict, timeout: int) -> dict:
         return _request(url, api_key, timeout, retry)
 
 
+def lineage_of(panelist: dict) -> str:
+    """Which training lineage a panelist belongs to.
+
+    The value of a panel is not five opinions, it is DECORRELATED blind spots.
+    Two models sharing a base or overlapping training data miss the same bug in
+    the same way and then agree with each other -- and that agreement reads as
+    consensus when it is one perspective counted twice. A panel is therefore
+    most confidently wrong exactly where its members are most alike, which is
+    the opposite of what a review is for.
+
+    Observed here: gpt-oss and nemotron independently asserted that
+    `except Exception` catches KeyboardInterrupt. It does not. Two votes, one
+    error, and majority logic would have promoted it.
+
+    Explicit `lineage` in config wins. Otherwise derive from the vendor prefix,
+    which is a proxy and not ground truth -- published lineage says nothing
+    about data overlap or distillation between labs. It separates the cases we
+    can see and stays silent about the ones we cannot.
+    """
+    if panelist.get("lineage"):
+        return panelist["lineage"]
+    model = panelist.get("model", "")
+    if "/" in model:
+        return model.split("/")[0].lower()
+    return panelist.get("provider", "unknown").lower()
+
+
+def lineage_groups(panel: list) -> dict:
+    """{lineage: [panelist names]} for the enabled panel."""
+    groups: dict = {}
+    for p in panel:
+        groups.setdefault(lineage_of(p), []).append(p["name"])
+    return groups
+
+
+def collapsed_vote_count(panel: list) -> int:
+    """Independent perspectives, not seats. Same-lineage panelists count once."""
+    return len(lineage_groups(panel))
+
+
 def provider_of(cfg: dict, panelist: dict) -> dict:
     name = panelist.get("provider")
     provider = cfg.get("providers", {}).get(name)
@@ -1080,6 +1120,18 @@ def cmd_show(cfg: dict, roles: dict, creds: dict) -> int:
         role = p.get("role", "-") if not p.get("lens") else "custom"
         print(f"{p['name']:<12} {p.get('provider','?'):<10} {role:<16} "
               f"{has_key:<9} {p['model']}{state}")
+    groups = lineage_groups([p for p in cfg["panelists"] if p.get("enabled", True)])
+    dupes = {k: v for k, v in groups.items() if len(v) > 1}
+    print(f"\n{len(groups)} independent lineage(s) across "
+          f"{sum(len(v) for v in groups.values())} enabled panelist(s)")
+    if dupes:
+        print("\nCORRELATED PANELISTS — agreement between these is one "
+              "perspective, not two:")
+        for lin, names in dupes.items():
+            print(f"  {lin}: {', '.join(names)}")
+        print("  A panel is most confidently wrong where its members are most "
+              "alike.\n  Swap one out, or weight their agreement as a single "
+              "vote when synthesising.")
     _ = roles
     return 0
 
@@ -1182,8 +1234,20 @@ def cmd_ask(cfg: dict, roles: dict, creds: dict, panel: list[dict],
     ok = [r for r in results if r["ok"]]
     bad = [r for r in results if not r["ok"]]
 
+    groups = lineage_groups(panel)
+    dupes = {k: v for k, v in groups.items() if len(v) > 1}
+    if dupes:
+        print(f"{'=' * 72}\nCORRELATED PANELISTS\n{'=' * 72}")
+        for lin, names in dupes.items():
+            print(f"  {lin}: {', '.join(names)} — count agreement between these "
+                  f"as ONE vote")
+        print(f"  {collapsed_vote_count(panel)} independent perspective(s), "
+              f"{len(panel)} seats.")
+
     for r in ok:
-        print(f"\n{'=' * 72}\nPANELIST: {r['name']}  [{r['label']}]\n"
+        lin = lineage_of(next(p for p in panel if p["name"] == r["name"]))
+        print(f"\n{'=' * 72}\nPANELIST: {r['name']}  [{r['label']}]  "
+              f"lineage: {lin}\n"
               f"model: {r['model']}   elapsed: {r['elapsed']}s   "
               f"tokens: {r['tokens']}\n{'=' * 72}")
         print(r["text"] or "(empty response)")
