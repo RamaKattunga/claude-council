@@ -1,6 +1,8 @@
 {
   "name": "claude-council-marketplace",
-  "owner": {"name": "Rama Kattunga"},
+  "owner": {
+    "name": "claude-council"
+  },
   "plugins": [
     {
       "name": "claude-council",
