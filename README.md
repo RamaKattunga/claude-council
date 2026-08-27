@@ -76,8 +76,8 @@ security add-generic-password -a "$USER" -s nvidia-api-key -w
 
 **3. Configure** — open the UI and pick your panel:
 
-```bash
-python3 scripts/council.py --serve
+```
+/council:config
 ```
 
 **4. Review:**
@@ -90,8 +90,11 @@ python3 scripts/council.py --serve
 
 ![Panel and health](docs/img/ui-panel-health.jpg)
 
-`--serve` opens a local page: store keys, probe the catalog live, pick panelists, assign roles,
-and read health. No hand-written JSON.
+`/council:config` opens a local page: store keys, probe the catalog live, pick panelists, assign
+roles, and read health. No hand-written JSON.
+
+The server prints a URL containing a one-time token and opens your browser. Keep the terminal open
+— it stops when that terminal closes or after 30 minutes idle.
 
 **Live probing matters more than it sounds.** NVIDIA's `/v1/models` lists models the gateway does
 not actually serve — they fail with `404 Function not found`. In the screenshot above, **5 of 24
@@ -170,12 +173,22 @@ bad setting, not a bad model.
 
 | Command | Does |
 |---|---|
-| `/council:setup` | Store a key, discover working models, choose panelists and roles |
+| `/council:config` | Open the web UI — keys, model probing, panel, roles, health |
+| `/council:setup` | Same, guided conversationally instead of in a browser |
 | `/council:review [target]` | Run a review and synthesize the results |
 | `/council:health` | Reliability report with swap recommendations |
 
 <details>
 <summary>CLI reference</summary>
+
+The script lives inside the installed plugin. To call it directly:
+
+```bash
+COUNCIL=$(echo ~/.claude/plugins/cache/claude-council-marketplace/claude-council/*/scripts/council.py)
+python3 "$COUNCIL" --show
+```
+
+Or run it from a clone: `python3 scripts/council.py --show`.
 
 ```bash
 council.py --serve                  # configuration UI
