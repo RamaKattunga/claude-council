@@ -1,6 +1,6 @@
 {
   "name": "claude-council",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Cross-vendor code review. Fans a prompt out to several OpenAI-compatible models in parallel, each with a distinct review role, then synthesizes consensus and disagreement. Works with any OpenAI-compatible endpoint including NVIDIA NIM, so panelists are not limited to Codex and Gemini CLIs.",
   "author": {
     "name": "claude-council contributors",
