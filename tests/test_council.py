@@ -7,9 +7,27 @@ SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "council.py"
 
 
 def run(args, home, stdin=None):
+    """Run the CLI against a throwaway COUNCIL_HOME.
+
+    Clearing the env vars is not enough: key resolution falls through to the
+    macOS Keychain, so a developer with a real key configured would have the
+    suite make live API calls -- slow, billable, and dependent on someone
+    else's uptime. Point keychain_service at a name that cannot exist so the
+    lookup always misses.
+    """
     env = {**os.environ, "COUNCIL_HOME": str(home)}
     env.pop("NVIDIA_API_KEY", None)
     env.pop("OPENAI_API_KEY", None)
+    cfg = Path(home) / "config.json"
+    if cfg.exists():
+        c = json.loads(cfg.read_text())
+        changed = False
+        for prov in c.get("providers", {}).values():
+            if prov.get("keychain_service") != "council-test-no-such-service":
+                prov["keychain_service"] = "council-test-no-such-service"
+                changed = True
+        if changed:
+            cfg.write_text(json.dumps(c, indent=2) + "\n")
     return subprocess.run([sys.executable, str(SCRIPT), *args], input=stdin,
                           capture_output=True, text=True, env=env, timeout=60)
 
@@ -175,6 +193,71 @@ class SecretPreflightTests(unittest.TestCase):
         self.assertEqual(r.returncode, 2)
         self.assertIn("REFUSED", r.stdout + r.stderr)
         self.assertNotIn("AKIAIOSFODNN7EXAMPLE", r.stdout + r.stderr)
+
+
+class PolicyHookTests(unittest.TestCase):
+    """The regex scan catches credential shapes. It cannot recognise a
+    proprietary algorithm or an unreleased strategy, and that class of exposure
+    is invisible to pattern matching by definition. The hook exists so the tool
+    does not have to grow a worse detector than the ones security teams already
+    run."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self.tmp.name) / "council"
+        run(["--show"], self.home)
+        self.hook = Path(self.tmp.name) / "hook.sh"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _set_hook(self, body, timeout=30):
+        self.hook.write_text("#!/bin/bash\n" + body + "\n")
+        self.hook.chmod(0o755)
+        cfg = self.home / "config.json"
+        c = json.loads(cfg.read_text())
+        c["policy_hook"] = {"command": [str(self.hook)], "timeout": timeout}
+        cfg.write_text(json.dumps(c, indent=2) + "\n")
+
+    def _prompt(self, text="review this\n"):
+        p = Path(self.tmp.name) / "p.txt"
+        p.write_text(text)
+        return str(p)
+
+    def test_a_refusing_hook_blocks_dispatch_and_gives_the_reason(self):
+        self._set_hook('echo "unreleased strategy may not leave the building"; exit 1')
+        r = run(["--prompt-file", self._prompt()], self.home)
+        self.assertEqual(r.returncode, 3)
+        self.assertIn("unreleased strategy", r.stdout + r.stderr)
+
+    def test_the_hook_receives_the_exact_prompt_on_stdin(self):
+        marker = "CANARY-8fd21"
+        out = Path(self.tmp.name) / "seen.txt"
+        self._set_hook(f'cat > {out}; exit 1')
+        run(["--prompt-file", self._prompt(f"review {marker}\n")], self.home)
+        self.assertIn(marker, out.read_text())
+
+    def test_a_missing_hook_fails_closed(self):
+        """A configured backend that is not there is a broken control, not an
+        absent one. Failing open here would ship the data the hook exists to
+        withhold."""
+        cfg = self.home / "config.json"
+        c = json.loads(cfg.read_text())
+        c["policy_hook"] = {"command": ["/nonexistent/guard-binary"]}
+        cfg.write_text(json.dumps(c, indent=2) + "\n")
+        r = run(["--prompt-file", self._prompt()], self.home)
+        self.assertEqual(r.returncode, 3)
+        self.assertIn("not found", r.stdout + r.stderr)
+
+    def test_a_hanging_hook_fails_closed(self):
+        self._set_hook("sleep 30", timeout=1)
+        r = run(["--prompt-file", self._prompt()], self.home)
+        self.assertEqual(r.returncode, 3)
+        self.assertIn("timed out", r.stdout + r.stderr)
+
+    def test_no_hook_configured_is_not_an_error(self):
+        r = run(["--prompt-file", self._prompt()], self.home)
+        self.assertNotEqual(r.returncode, 3, "absent hook must not block")
 
 
 class ValidatorContractTests(unittest.TestCase):

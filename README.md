@@ -224,6 +224,31 @@ The tool refuses to dispatch a prompt containing anything that looks like a cred
 (`--allow-secrets` overrides). The scanner is deliberately biased toward false positives: a
 spurious warning costs you one flag, a missed key costs a rotation across every vendor.
 
+### Pluggable policy backend
+
+The regex scan is shape-matching. The exposure that actually matters — a proprietary
+algorithm, an unreleased strategy, customer data that reads as ordinary prose — is invisible
+to it by definition. Rather than grow a worse detector inside a code-review tool, the
+pre-dispatch check is a seam:
+
+```json
+"policy_hook": { "command": ["/usr/local/bin/your-guard"], "timeout": 60 }
+```
+
+Contract, kept minimal so it is trivial to implement:
+
+| | |
+|---|---|
+| stdin | the exact bytes that would be dispatched |
+| env | `COUNCIL_PANEL_SIZE`, `COUNCIL_PROVIDERS` |
+| exit 0 | allow |
+| non-zero | refuse; stdout is shown to the user as the reason |
+
+Anything satisfying that works: a corporate DLP, an off-the-shelf guard, a policy service, or
+twenty lines of grep your security team already trusts. **It fails closed** — a configured
+backend that is missing, hanging, or erroring blocks dispatch, because a broken control is
+not an absent one, and this is the one place where failing open ships the data anyway.
+
 **Known limits, stated so nobody mistakes the scan for a guarantee.** It works line by line
 on literal text, so it does not catch:
 

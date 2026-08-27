@@ -226,6 +226,60 @@ def _scan_pii(line: str) -> tuple | None:
     return None
 
 
+def run_policy_hook(cfg: dict, prompt: str, panel: list) -> tuple:
+    """Hand the prompt to an external policy backend before any dispatch.
+
+    The built-in regex scan catches credential SHAPES. It cannot recognise a
+    proprietary algorithm, an unreleased strategy, or customer data that looks
+    like ordinary text -- and that class of exposure is the one that actually
+    matters, because it is invisible to pattern matching by definition.
+
+    Rather than grow a worse detector inside a code-review tool, expose the
+    seam. Anything that reads stdin and sets an exit code can sit here: a
+    corporate DLP, an off-the-shelf guard, a policy service, or twenty lines of
+    grep somebody's security team already trusts.
+
+    Contract, deliberately minimal so it is trivial to implement:
+      stdin  -- the exact bytes that would be dispatched
+      env    -- COUNCIL_PANEL_SIZE, COUNCIL_PROVIDERS (comma separated)
+      exit 0 -- allow
+      non-0  -- refuse; stdout/stderr is shown to the user as the reason
+
+    Returns (allowed, reason).
+    """
+    conf = cfg.get("policy_hook")
+    if not conf or not conf.get("command"):
+        return True, ""
+
+    cmd = conf["command"]
+    if isinstance(cmd, str):
+        cmd = [cmd]
+    providers = sorted({p.get("provider", "?") for p in panel})
+    env = {
+        **os.environ,
+        "COUNCIL_PANEL_SIZE": str(len(panel)),
+        "COUNCIL_PROVIDERS": ",".join(providers),
+    }
+    try:
+        r = subprocess.run(cmd, input=prompt, capture_output=True, text=True,
+                           timeout=conf.get("timeout", 60), env=env)
+    except FileNotFoundError:
+        # Fail CLOSED. A policy backend the user configured and that is not
+        # there is a broken control, not an absent one -- and this is the one
+        # place in the tool where failing open would ship the data anyway.
+        return False, (f"policy hook {cmd[0]!r} not found. Fix the command in "
+                       f"config.json, or remove policy_hook to disable it.")
+    except subprocess.TimeoutExpired:
+        return False, f"policy hook timed out after {conf.get('timeout', 60)}s"
+    except Exception as exc:
+        return False, f"policy hook failed: {type(exc).__name__}: {exc}"
+
+    if r.returncode == 0:
+        return True, ""
+    reason = (r.stdout or "").strip() or (r.stderr or "").strip()
+    return False, reason or f"policy hook exited {r.returncode}"
+
+
 def scan_for_secrets(text: str) -> list:
     """Return [(line_no, label, redacted_excerpt)] for anything that looks secret.
 
@@ -1216,6 +1270,11 @@ def main() -> int:
         prompt = sys.stdin.read()
     if not prompt.strip():
         sys.exit("Empty prompt.")
+
+    allowed, reason = run_policy_hook(cfg, prompt, panel)
+    if not allowed:
+        print(f"REFUSED by policy hook.\n\n  {reason}\n", file=sys.stderr)
+        return 3
 
     findings = scan_for_secrets(prompt)
     if findings and not args.allow_secrets:
