@@ -213,6 +213,23 @@ Keys are never written to `config.json`, never passed as command-line arguments 
 of `ps` and shell history), and never printed. Diagnostics report length and a SHA-256 fingerprint
 only.
 
+## What leaves your machine
+
+**Your diff is sent, in full, to every panelist you configure.** That is the mechanism, not
+a side effect — but fan-out multiplies the consequences. One review means N copies of your
+code sitting with N providers, each with its own retention policy, jurisdiction, and terms.
+Unlike a commit, there is no way to un-send it.
+
+The tool refuses to dispatch a prompt containing anything that looks like a credential
+(`--allow-secrets` overrides). The scanner is deliberately biased toward false positives: a
+spurious warning costs you one flag, a missed key costs a rotation across every vendor.
+
+It is a backstop, not a boundary. It will not catch proprietary algorithms, customer data,
+unreleased strategy, or anything else that is sensitive without looking like a secret.
+**Scoping the diff is the operator's job.** Do not point this at code you are not free to
+share with third-party inference providers, and check each provider's data-retention terms
+before seating it — a free tier often means your input trains something.
+
 ## Known gotchas
 
 These cost real debugging time. They are provider behaviour, not bugs here:

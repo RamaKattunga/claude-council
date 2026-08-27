@@ -9,6 +9,13 @@ Run a council review on: $ARGUMENTS
 **1. Scope it.** The panel is not a whole-codebase tool. Reviews need a focused diff or a single
 module. Large prompts push slow panelists past their timeout and can trip gateway 404s.
 
+**1b. Scope it for disclosure, not just for size.** The diff is sent in full to every
+panelist — N providers, N retention policies, N jurisdictions, and no way to un-send it. The
+runner refuses prompts containing anything credential-shaped, but that is a backstop, not a
+boundary: it will not recognise proprietary algorithms, customer data, or unreleased
+strategy. If the user has not signalled that this code can go to third-party inference
+providers, ask before dispatching.
+
 **2. Build the prompt as a file** - never inline a diff, quoting will bite you. Include what the
 code is for, and demand concrete findings:
 

@@ -95,6 +95,67 @@ class CouncilTests(unittest.TestCase):
             self.assertIn(role, r.stdout)
 
 
+class SecretPreflightTests(unittest.TestCase):
+    """Fan-out multiplies the blast radius of a leaked credential.
+
+    One diff goes to N providers, each with its own retention policy and
+    jurisdiction, and unlike a git commit there is no way to un-send it. The
+    scanner is deliberately biased toward false positives: a spurious warning
+    costs one flag, a missed credential costs a rotation across every vendor --
+    assuming you even notice.
+    """
+
+    def setUp(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("council", SCRIPT)
+        self.m = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.m)
+
+    def test_catches_common_credential_shapes(self):
+        cases = {
+            "AKIAIOSFODNN7EXAMPLE": "AWS access key",
+            "sk-proj-AbCdEf0123456789XyZaBcDe": "OpenAI key",
+            "nvapi-AbCdEf0123456789XyZaBcDeFg": "NVIDIA key",
+            "ghp_AbCdEf0123456789XyZaBcDeFgHi": "GitHub token",
+            "-----BEGIN RSA PRIVATE KEY-----": "private key",
+            "postgres://admin:hunter2@db:5432/x": "connection string with password",
+            'password = "correcthorsebattery"': "assigned secret",
+        }
+        for text, label in cases.items():
+            found = self.m.scan_for_secrets(text)
+            self.assertTrue(found, f"missed: {label} in {text[:30]}")
+            self.assertEqual(found[0][1], label, f"mislabelled {text[:30]}")
+
+    def test_reports_the_line_number(self):
+        text = "clean\nalso clean\nAKIAIOSFODNN7EXAMPLE\n"
+        self.assertEqual(self.m.scan_for_secrets(text)[0][0], 3)
+
+    def test_never_echoes_the_secret_in_full(self):
+        secret = "AKIAIOSFODNN7EXAMPLE"
+        _, _, shown = self.m.scan_for_secrets(secret)[0]
+        self.assertNotIn(secret, shown)
+        self.assertLess(len(shown), len(secret))
+
+    def test_ordinary_code_is_not_flagged(self):
+        code = ("def add(a, b):\n    return a + b\n"
+                "# token = the auth token is validated upstream\n"
+                "api_key = os.environ['API_KEY']\n"
+                "self.assertEqual(status, 200)\n")
+        self.assertEqual(self.m.scan_for_secrets(code), [],
+                         "false positive on ordinary code")
+
+    def test_dispatch_is_refused_when_a_secret_is_present(self):
+        import tempfile, os
+        home = Path(tempfile.mkdtemp()) / "council"
+        run(["--show"], home)
+        p = Path(tempfile.mktemp(suffix=".txt"))
+        p.write_text("review this\nAKIAIOSFODNN7EXAMPLE\n")
+        r = run(["--prompt-file", str(p)], home)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("REFUSED", r.stdout + r.stderr)
+        self.assertNotIn("AKIAIOSFODNN7EXAMPLE", r.stdout + r.stderr)
+
+
 class ValidatorContractTests(unittest.TestCase):
     """validate_panelists runs inside HTTP handler threads, so it must be pure:
     return problems, write nothing, never call sys.exit. A previous refactor

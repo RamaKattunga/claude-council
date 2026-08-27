@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import hashlib
 import secrets
 import stat
@@ -168,6 +169,49 @@ def _request(url: str, api_key: str, timeout: int, payload: dict | None = None) 
 
 
 # ---------------------------------------------------------------- panel wiring
+
+# Patterns for material that must not be shipped to third-party inference
+# providers. Deliberately biased toward false positives: a spurious warning
+# costs one --allow-secrets flag, while a missed credential is unrecallable
+# once five providers have logged it.
+SECRET_PATTERNS = [
+    ("private key", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")),
+    ("AWS access key", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
+    ("GitHub token", re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}")),
+    ("OpenAI key", re.compile(r"\bsk-[A-Za-z0-9_-]{20,}")),
+    ("NVIDIA key", re.compile(r"\bnvapi-[A-Za-z0-9_-]{20,}")),
+    ("Slack token", re.compile(r"\bxox[abprs]-[A-Za-z0-9-]{10,}")),
+    ("Google API key", re.compile(r"\bAIza[0-9A-Za-z_-]{35}\b")),
+    ("JWT", re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}")),
+    ("connection string with password",
+     re.compile(r"\b\w+://[^\s:@/]+:[^\s:@/]+@")),
+    ("assigned secret",
+     re.compile(r"(?i)\b(api[_-]?key|secret|password|passwd|token|auth)\b"
+                r"\s*[:=]\s*[\"']?[A-Za-z0-9_\-/+]{12,}")),
+]
+
+
+def scan_for_secrets(text: str) -> list:
+    """Return [(line_no, label, redacted_excerpt)] for anything that looks secret.
+
+    The whole point of a council is fan-out: one diff goes to N providers, each
+    with its own retention policy, its own jurisdiction, and its own terms. That
+    multiplies the blast radius of a credential pasted into a review prompt, and
+    unlike a git commit there is no way to un-send it. Refusing by default costs
+    a flag; the alternative costs a rotation across five vendors, assuming you
+    even notice.
+    """
+    findings = []
+    for n, line in enumerate(text.splitlines(), 1):
+        for label, pat in SECRET_PATTERNS:
+            m = pat.search(line)
+            if m:
+                frag = m.group(0)
+                shown = frag[:6] + "…" + frag[-2:] if len(frag) > 12 else "…"
+                findings.append((n, label, shown))
+                break
+    return findings
+
 
 def _post_chat(url: str, api_key: str, payload: dict, timeout: int) -> dict:
     """POST a chat completion, adapting once to provider parameter quirks.
@@ -1065,6 +1109,9 @@ def main() -> int:
     ap.add_argument("--prompt-file")
     ap.add_argument("--prompt")
     ap.add_argument("--only", help="comma-separated panelist names")
+    ap.add_argument("--allow-secrets", action="store_true",
+                    help="dispatch even if the prompt looks like it contains "
+                         "credentials (default: refuse)")
     ap.add_argument("--provider", help="restrict --list-models to one provider")
     ap.add_argument("--list-models", action="store_true")
     ap.add_argument("--list-roles", action="store_true")
@@ -1128,6 +1175,24 @@ def main() -> int:
         prompt = sys.stdin.read()
     if not prompt.strip():
         sys.exit("Empty prompt.")
+
+    findings = scan_for_secrets(prompt)
+    if findings and not args.allow_secrets:
+        print(f"REFUSED: {len(findings)} possible secret(s) in the prompt.\n",
+              file=sys.stderr)
+        for n, label, shown in findings[:20]:
+            print(f"  line {n}: {label}  ({shown})", file=sys.stderr)
+        if len(findings) > 20:
+            print(f"  ... and {len(findings) - 20} more", file=sys.stderr)
+        print(f"\nThis prompt would be sent to {len(panel)} separate providers, "
+              f"each with its own\nretention policy and jurisdiction. There is no "
+              f"way to un-send it.\n\nRemove the material, or pass --allow-secrets "
+              f"if these are false positives.", file=sys.stderr)
+        return 2
+    if findings:
+        print(f"WARNING: dispatching {len(findings)} possible secret(s) to "
+              f"{len(panel)} providers (--allow-secrets).", file=sys.stderr)
+
     return cmd_ask(cfg, roles, creds, panel, prompt, timeout)
 
 
