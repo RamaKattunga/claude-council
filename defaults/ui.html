@@ -1,0 +1,211 @@
+<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Council configuration</title>
+<style>
+:root{--bg:#fbfbfa;--fg:#1a1a18;--dim:#6b6b66;--line:#e2e2dd;--card:#fff;
+--ok:#1a7f4b;--bad:#b4341f;--warn:#8a6100;--accent:#2b5cd9;--mono:ui-monospace,SFMono-Regular,Menlo,monospace}
+@media(prefers-color-scheme:dark){:root{--bg:#161614;--fg:#eceae5;--dim:#9b978e;
+--line:#2e2b28;--card:#1e1c1a;--ok:#4ec27f;--bad:#f0705a;--warn:#d9a441;--accent:#7aa2f7}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.55 ui-sans-serif,system-ui,-apple-system,sans-serif}
+.wrap{max-width:940px;margin:0 auto;padding:32px 20px 80px}
+h1{font-size:22px;margin:0 0 4px;letter-spacing:-.01em}
+h2{font-size:15px;margin:0 0 12px;letter-spacing:.04em;text-transform:uppercase;color:var(--dim)}
+.sub{color:var(--dim);font-size:13px;margin:0 0 28px}
+section{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:20px;margin-bottom:18px}
+table{width:100%;border-collapse:collapse;font-size:14px}
+th{text-align:left;font-weight:600;font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--dim);padding:0 10px 8px 0;border-bottom:1px solid var(--line)}
+td{padding:9px 10px 9px 0;border-bottom:1px solid var(--line);vertical-align:middle}
+tr:last-child td{border-bottom:none}
+code,.mono{font-family:var(--mono);font-size:13px}
+button{font:inherit;font-size:13px;padding:7px 13px;border-radius:7px;border:1px solid var(--line);
+background:var(--card);color:var(--fg);cursor:pointer}
+button:hover:not(:disabled){border-color:var(--dim)}
+button:disabled{opacity:.45;cursor:default}
+button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+select,input{font:inherit;font-size:13px;padding:6px 9px;border-radius:7px;border:1px solid var(--line);
+background:var(--bg);color:var(--fg);max-width:100%}
+input[type=password]{font-family:var(--mono);width:340px}
+.ok{color:var(--ok)}.bad{color:var(--bad)}.warn{color:var(--warn)}.dim{color:var(--dim)}
+.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.note{font-size:12.5px;color:var(--dim);margin-top:10px;line-height:1.5}
+.scroll{overflow-x:auto}
+.pill{display:inline-block;font-size:11px;padding:2px 7px;border-radius:20px;border:1px solid var(--line);color:var(--dim)}
+.bar{height:3px;background:var(--line);border-radius:2px;overflow:hidden;margin-top:6px}
+.bar>i{display:block;height:100%;background:var(--accent)}
+#toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:var(--fg);color:var(--bg);
+padding:10px 18px;border-radius:8px;font-size:13px;opacity:0;transition:opacity .2s;pointer-events:none}
+#toast.show{opacity:1}
+</style></head><body><div class="wrap">
+
+<h1>Council configuration</h1>
+<p class="sub">Local only &middot; <span class="mono" id="cfgpath"></span></p>
+
+<section>
+  <h2>Keys</h2>
+  <div class="scroll"><table id="keys"><thead><tr>
+    <th>Provider</th><th>Source</th><th>Fingerprint</th><th></th>
+  </tr></thead><tbody></tbody></table></div>
+  <div class="note">Keys are stored, never displayed. Only a SHA-256 fingerprint is shown.
+  The macOS Keychain is preferred over the file store &mdash; encrypted at rest, and it stays out of backups.</div>
+</section>
+
+<section>
+  <h2>Available models</h2>
+  <div class="row">
+    <button id="probe" class="primary">Probe catalog</button>
+    <span id="probestat" class="dim">Not probed yet</span>
+  </div>
+  <div class="bar" id="pbar" style="display:none"><i style="width:40%"></i></div>
+  <div class="scroll"><table id="models" style="margin-top:14px;display:none"><thead><tr>
+    <th>Model</th><th>Latency</th><th>Vendor</th><th>Use</th>
+  </tr></thead><tbody></tbody></table></div>
+  <div class="note">The catalog lists models the gateway does not actually serve; they fail with
+  <code>404 Function not found</code>. Probing is the only way to know. Dead ones are remembered and skipped next time.</div>
+</section>
+
+<section>
+  <h2>Panel</h2>
+  <div class="scroll"><table id="panel"><thead><tr>
+    <th>Name</th><th>Model</th><th>Role</th><th>On</th><th></th>
+  </tr></thead><tbody></tbody></table></div>
+  <div class="row" style="margin-top:14px">
+    <button id="save" class="primary">Save panel</button>
+    <button id="check">Test all</button>
+    <span id="savestat" class="dim"></span>
+  </div>
+  <div class="note">Prefer five <em>different vendors</em> over five strong models from two &mdash;
+  correlated panelists share blind spots, which defeats the point of a cross-vendor panel.
+  Keep the roles distinct too: same-prompt panels converge on the same shallow findings.</div>
+</section>
+
+<section>
+  <h2>Health</h2>
+  <div class="scroll"><table id="health"><thead><tr>
+    <th>Panelist</th><th>Runs</th><th>Rate</th><th>Avg</th><th>Issues</th>
+  </tr></thead><tbody></tbody></table></div>
+  <div class="note">Flagged as <span class="bad">unreliable</span> below 80% success over 3+ runs,
+  or <span class="warn">too slow</span> above 120s average. A panelist that always answers but takes
+  minutes is unusable &mdash; the panel is only as fast as its slowest member.</div>
+</section>
+
+<div id="toast"></div>
+</div><script>
+const T=new URLSearchParams(location.search).get('t')||'__TOKEN__';
+let S={panelists:[],roles:{},providers:{}},LIVE=[];
+const $=s=>document.querySelector(s), esc=s=>String(s).replace(/[<>&"]/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;'}[c]));
+function toast(m){const t=$('#toast');t.textContent=m;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),2600)}
+async function api(p,opt={}){
+  const r=await fetch(p,{...opt,headers:{'X-Council-Token':T,'Content-Type':'application/json',...(opt.headers||{})}});
+  const j=await r.json().catch(()=>({error:'bad response'}));
+  if(!r.ok)throw new Error(j.error||('HTTP '+r.status));
+  return j;
+}
+function drawKeys(){
+  $('#keys tbody').innerHTML=Object.entries(S.providers).map(([n,p])=>{
+    const src=p.source==='NONE'?'<span class="bad">not set</span>':`<span class="ok">${esc(p.source)}</span>`;
+    const fp=p.fingerprint?`<code>${esc(p.fingerprint)}</code> <span class="dim">${p.length} chars</span>`:'<span class="dim">&mdash;</span>';
+    return `<tr><td><b>${esc(n)}</b></td><td>${src}</td><td>${fp}</td>
+      <td><input type="password" id="k-${esc(n)}" placeholder="paste key to store" autocomplete="off">
+      <button onclick="setKey('${esc(n)}')">Store</button></td></tr>`}).join('');
+}
+async function setKey(n){
+  const el=$('#k-'+n), v=el.value.trim();
+  if(!v)return toast('Nothing pasted');
+  try{const r=await api('/api/key',{method:'POST',body:JSON.stringify({provider:n,key:v})});
+    el.value='';toast(`Stored - fingerprint ${r.fingerprint}`);load();
+  }catch(e){toast('Failed: '+e.message)}
+}
+function drawPanel(){
+  const opts=Object.entries(S.roles).map(([k,l])=>[k,l]);
+  const models=[...new Set([...LIVE.map(m=>m.model),...S.panelists.map(p=>p.model)])].sort();
+  $('#panel tbody').innerHTML=S.panelists.map((p,i)=>`<tr>
+    <td><input value="${esc(p.name)}" style="width:110px" onchange="upd(${i},'name',this.value)"></td>
+    <td><select onchange="upd(${i},'model',this.value)" style="max-width:280px">
+      ${models.map(m=>`<option ${m===p.model?'selected':''}>${esc(m)}</option>`).join('')}</select></td>
+    <td><select onchange="upd(${i},'role',this.value)" title="${esc(S.role_text&&S.role_text[p.role]||'')}">
+      ${opts.map(([k,l])=>`<option value="${esc(k)}" ${k===p.role?'selected':''}>${esc(l)}</option>`).join('')}</select></td>
+    <td><input type="checkbox" ${p.enabled!==false?'checked':''} onchange="upd(${i},'enabled',this.checked)"></td>
+    <td><button onclick="rm(${i})">Remove</button></td></tr>`).join('')
+    +`<tr><td colspan="5"><button onclick="add()">+ Add panelist</button>
+      <span class="dim" style="margin-left:10px">${S.panelists.filter(p=>p.enabled!==false).length} enabled</span></td></tr>`;
+}
+function upd(i,k,v){S.panelists[i][k]=v;if(k==='role')drawPanel()}
+function rm(i){S.panelists.splice(i,1);drawPanel()}
+function add(){
+  const used=new Set(S.panelists.map(p=>p.model));
+  const free=LIVE.find(m=>!used.has(m.model));
+  S.panelists.push({name:'panelist'+(S.panelists.length+1),provider:'nvidia',
+    model:free?free.model:(LIVE[0]&&LIVE[0].model)||'',role:'generalist',enabled:true,max_tokens:8192});
+  drawPanel();
+}
+function drawModels(){
+  const seated=new Set(S.panelists.map(p=>p.model));
+  $('#models').style.display='';
+  $('#models tbody').innerHTML=LIVE.map(m=>{
+    const v=m.model.split('/')[0];
+    return `<tr><td><code>${esc(m.model)}</code></td>
+      <td>${m.latency.toFixed(1)}s ${m.latency>120?'<span class="warn">slow</span>':''}</td>
+      <td><span class="pill">${esc(v)}</span></td>
+      <td>${seated.has(m.model)?'<span class="dim">seated</span>':
+        `<button onclick="seat('${esc(m.model)}')">Add</button>`}</td></tr>`}).join('');
+}
+function seat(m){
+  S.panelists.push({name:m.split('/').pop().split('-')[0].slice(0,10),provider:'nvidia',
+    model:m,role:'generalist',enabled:true,max_tokens:8192});
+  drawPanel();drawModels();toast('Added - pick a role, then Save panel');
+}
+$('#probe').onclick=async()=>{
+  $('#probe').disabled=true;$('#pbar').style.display='';
+  $('#probestat').textContent='Probing... this takes ~30s';
+  try{const r=await api('/api/probe',{method:'POST',body:JSON.stringify({provider:'nvidia',limit:24})});
+    LIVE=r.live;
+    $('#probestat').innerHTML=`<span class="ok">${r.live.length} live</span> of ${r.probed} probed`
+      +(r.dead?` &middot; ${r.dead} not served`:'')+(r.skipped?` &middot; ${r.skipped} known dead skipped`:'');
+    drawModels();drawPanel();
+  }catch(e){$('#probestat').innerHTML='<span class="bad">'+esc(e.message)+'</span>'}
+  $('#probe').disabled=false;$('#pbar').style.display='none';
+};
+$('#save').onclick=async()=>{
+  $('#savestat').textContent='Saving...';
+  try{const r=await api('/api/config',{method:'POST',body:JSON.stringify({panelists:S.panelists})});
+    $('#savestat').innerHTML=`<span class="ok">Saved ${r.count} panelists</span>`;toast('Config written');
+  }catch(e){$('#savestat').innerHTML='<span class="bad">'+esc(e.message)+'</span>'}
+};
+$('#check').onclick=async()=>{
+  $('#savestat').textContent='Testing...';
+  try{const r=await api('/api/check',{method:'POST',body:'{}'});
+    const ok=r.results.filter(x=>x.ok).length;
+    $('#savestat').innerHTML=r.results.map(x=>x.ok
+      ?`<span class="ok">${esc(x.name)} ${x.latency}s</span>`
+      :`<span class="bad">${esc(x.name)} failed</span>`).join(' &middot; ')+` &mdash; ${ok}/${r.results.length}`;
+    loadHealth();
+  }catch(e){$('#savestat').innerHTML='<span class="bad">'+esc(e.message)+'</span>'}
+};
+async function loadHealth(){
+  try{const h=await api('/api/health');const st=h.panelists||{};
+    const rows=Object.entries(st).map(([n,s])=>{
+      const rate=s.attempts?s.ok/s.attempts:0;
+      const lat=s.latencies||[];const avg=lat.length?lat.reduce((a,b)=>a+b,0)/lat.length:0;
+      let flag='';
+      if(s.attempts>=3&&rate<0.8)flag=' <span class="bad">unreliable</span>';
+      else if(avg>120)flag=' <span class="warn">too slow</span>';
+      const iss=Object.entries(s.errors||{}).map(([k,v])=>`${k}&times;${v}`).join(', ')||'&mdash;';
+      return `<tr><td><b>${esc(n)}</b>${flag}</td><td>${s.attempts}</td>
+        <td>${(rate*100).toFixed(0)}%</td><td>${avg?avg.toFixed(1)+'s':'&mdash;'}</td><td class="dim">${iss}</td></tr>`});
+    $('#health tbody').innerHTML=rows.join('')||'<tr><td colspan="5" class="dim">No history yet. Run Test all.</td></tr>';
+  }catch(e){}
+}
+async function load(){
+  try{const s=await api('/api/state');
+    S={...s,panelists:s.panelists.map(p=>({...p}))};
+    $('#cfgpath').textContent=s.config_path;
+    drawKeys();drawPanel();loadHealth();
+  }catch(e){document.body.innerHTML='<div class="wrap"><h1>Cannot reach the council server</h1>'
+    +'<p class="sub">'+esc(e.message)+' &mdash; the token may be stale. Restart with <code>--serve</code>.</p></div>'}
+}
+load();
+</script></body></html>

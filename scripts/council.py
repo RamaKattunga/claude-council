@@ -21,6 +21,7 @@ import argparse
 import json
 import os
 import hashlib
+import secrets
 import stat
 import subprocess
 import sys
@@ -638,6 +639,245 @@ def cmd_suggest_swap(cfg: dict, creds: dict, name: str, timeout: int) -> int:
     return 0
 
 
+def cmd_serve(cfg: dict, roles: dict, creds: dict, port: int,
+              timeout: int) -> int:
+    """Local configuration UI.
+
+    Security posture, since this opens a socket on the user's machine:
+      - binds 127.0.0.1 only, never 0.0.0.0
+      - every API call must carry a per-run random token
+      - Host header is checked, which defeats DNS rebinding
+      - shuts down after IDLE_LIMIT seconds with no requests
+      - API keys are accepted but never sent back; only fingerprints leave
+    """
+    import http.server
+    import threading
+    import webbrowser
+
+    token = secrets.token_urlsafe(24)
+    ui_html = (BUNDLED / "ui.html").read_text()
+    ALLOWED_HOSTS = {f"127.0.0.1:{port}", f"localhost:{port}"}
+    IDLE_LIMIT = 1800
+    last_seen = [time.monotonic()]
+
+    def current() -> dict:
+        """Fresh state each request -- the CLI may have changed things."""
+        c = load_json(CONFIG_PATH, "config")
+        r = load_json(ROLES_PATH if ROLES_PATH.exists()
+                      else BUNDLED / "roles.json", "roles")
+        cr = load_creds()
+        return {"cfg": c, "roles": r, "creds": cr}
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        server_version = "council"
+
+        def log_message(self, *a):        # keep the terminal readable
+            pass
+
+        def _reject(self, code: int, msg: str):
+            body = json.dumps({"error": msg}).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _guard(self) -> bool:
+            if self.headers.get("Host") not in ALLOWED_HOSTS:
+                self._reject(403, "bad Host")      # DNS rebinding
+                return False
+            if self.headers.get("X-Council-Token") != token:
+                self._reject(403, "bad token")
+                return False
+            last_seen[0] = time.monotonic()
+            return True
+
+        def _json(self, obj, code: int = 200):
+            body = json.dumps(obj).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _body(self) -> dict:
+            n = int(self.headers.get("Content-Length") or 0)
+            if n > 1_000_000:
+                raise ValueError("body too large")
+            return json.loads(self.rfile.read(n) or b"{}")
+
+        def do_GET(self):
+            path = self.path.split("?")[0]
+            if path == "/":
+                if self.headers.get("Host") not in ALLOWED_HOSTS:
+                    return self._reject(403, "bad Host")
+                page = ui_html.replace("__TOKEN__", token)
+                body = page.encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Content-Security-Policy",
+                                 "default-src 'none'; style-src 'unsafe-inline'; "
+                                 "script-src 'unsafe-inline'; connect-src 'self'")
+                self.end_headers()
+                self.wfile.write(body)
+                last_seen[0] = time.monotonic()
+                return
+            if not self._guard():
+                return
+            st = current()
+            if path == "/api/state":
+                providers = {}
+                for pname, prov in st["cfg"].get("providers", {}).items():
+                    key = resolve_key(prov, st["creds"])
+                    providers[pname] = {
+                        "source": key_source(prov, st["creds"]),
+                        "fingerprint": fingerprint(key) if key else None,
+                        "length": len(key) if key else 0,
+                        "keychain_service": prov.get("keychain_service"),
+                    }
+                return self._json({
+                    "panelists": st["cfg"]["panelists"],
+                    "providers": providers,
+                    "roles": {k: v["label"] for k, v in st["roles"]["roles"].items()},
+                    "role_text": {k: v["lens"] for k, v in st["roles"]["roles"].items()},
+                    "config_path": str(CONFIG_PATH),
+                })
+            if path == "/api/health":
+                return self._json(load_health())
+            return self._reject(404, "no such endpoint")
+
+        def do_POST(self):
+            if not self._guard():
+                return
+            path = self.path.split("?")[0]
+            st = current()
+            try:
+                data = self._body()
+            except Exception as exc:
+                return self._reject(400, f"bad body: {exc}")
+
+            if path == "/api/key":
+                pname = data.get("provider")
+                key = (data.get("key") or "").strip()
+                prov = st["cfg"].get("providers", {}).get(pname)
+                if not prov:
+                    return self._reject(400, "unknown provider")
+                if not key:
+                    return self._reject(400, "empty key")
+                if any(ch.isspace() for ch in key):
+                    return self._reject(400, "key contains whitespace")
+                cr = load_creds()
+                cr[prov["api_key_env"]] = key
+                save_json(CREDS_PATH, cr, private=True)
+                # Deliberately return only a fingerprint, never the key.
+                return self._json({"ok": True, "fingerprint": fingerprint(key),
+                                   "length": len(key)})
+
+            if path == "/api/probe":
+                pname = data.get("provider", "nvidia")
+                prov = st["cfg"].get("providers", {}).get(pname)
+                if not prov:
+                    return self._reject(400, "unknown provider")
+                key = resolve_key(prov, st["creds"])
+                if not key:
+                    return self._reject(400, f"no key for {pname}")
+                try:
+                    cat = _request(prov["base_url"].rstrip("/") + "/models",
+                                   key, timeout)
+                except Exception as exc:
+                    return self._reject(502, f"catalog fetch failed: {exc}")
+
+                health = load_health()
+                dead = set(health.get("unavailable", []))
+                ids = [m["id"] for m in cat.get("data", [])
+                       if not any(t in m["id"].lower() for t in NON_CHAT)
+                       and m["id"] not in dead]
+                ids = ids[:int(data.get("limit", 24))]
+
+                probe_cfg = {"providers": st["cfg"]["providers"]}
+                results = []
+                with ThreadPoolExecutor(max_workers=8) as pool:
+                    futs = [pool.submit(
+                        ask, probe_cfg, {"roles": {}}, st["creds"],
+                        {"name": mid, "provider": pname, "model": mid,
+                         "lens": "You are a test probe.", "lens_label": "probe",
+                         "timeout": 60},
+                        "Reply with: ok", 60, 8) for mid in ids]
+                    for f in as_completed(futs):
+                        results.append(f.result())
+
+                newly_dead = [r["name"] for r in results
+                              if not r["ok"] and "404" in r.get("error", "")]
+                if newly_dead:
+                    health.setdefault("unavailable", [])
+                    health["unavailable"] = sorted(
+                        set(health["unavailable"]) | set(newly_dead))
+                    save_json(HEALTH_PATH, health)
+
+                live = sorted(({"model": r["model"], "latency": r["elapsed"]}
+                               for r in results if r["ok"]),
+                              key=lambda x: x["latency"])
+                return self._json({"live": live, "probed": len(ids),
+                                   "dead": len(newly_dead),
+                                   "skipped": len(dead)})
+
+            if path == "/api/config":
+                panelists = data.get("panelists")
+                if not isinstance(panelists, list) or not panelists:
+                    return self._reject(400, "panelists must be a non-empty list")
+                errors = validate_panelists(st["cfg"], st["roles"], panelists)
+                if errors:
+                    return self._json({"ok": False, "errors": errors}, 400)
+                write_panel(st["cfg"], panelists)
+                return self._json({"ok": True, "count": len(panelists)})
+
+            if path == "/api/check":
+                c = st["cfg"]
+                panel = [x for x in c["panelists"] if x.get("enabled", True)]
+                if not panel:
+                    return self._json({"results": []})
+                with ThreadPoolExecutor(max_workers=min(len(panel), 8)) as pool:
+                    futs = [pool.submit(ask, c, st["roles"], st["creds"], x,
+                                        "Reply with: ok", timeout, 8)
+                            for x in panel]
+                    res = [f.result() for f in as_completed(futs)]
+                record_outcomes(res)
+                return self._json({"results": [
+                    {"name": r["name"], "ok": r["ok"],
+                     "model": r.get("model", ""),
+                     "latency": r.get("elapsed"),
+                     "error": r.get("error", "")} for r in res]})
+
+            return self._reject(404, "no such endpoint")
+
+    httpd = http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    url = f"http://127.0.0.1:{httpd.server_port}/?t={token}"
+    print(f"Council configuration UI: {url}")
+    print("Bound to 127.0.0.1 only. The token is required and changes every run.")
+    print(f"Auto-stops after {IDLE_LIMIT // 60} min idle. Ctrl-C to stop now.")
+
+    def watchdog():
+        while True:
+            time.sleep(15)
+            if time.monotonic() - last_seen[0] > IDLE_LIMIT:
+                print("\nIdle -- shutting down.")
+                httpd.shutdown()
+                return
+    threading.Thread(target=watchdog, daemon=True).start()
+
+    try:
+        webbrowser.open(url)
+    except Exception:
+        pass
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        print("\nStopped.")
+    return 0
+
+
 def cmd_list_roles(roles: dict) -> int:
     for key, role in roles["roles"].items():
         print(f"\n{key}  [{role['label']}]")
@@ -662,11 +902,7 @@ def cmd_show(cfg: dict, roles: dict, creds: dict) -> int:
 
 
 def cmd_configure(cfg: dict, roles: dict) -> int:
-    """Read {"panelists":[...]} from stdin and replace the panel.
-
-    Each entry needs: name, provider, model, role. Optional: extra_body,
-    temperature, top_p, max_tokens, enabled.
-    """
+    """Read {"panelists":[...]} from stdin and replace the panel."""
     try:
         spec = json.load(sys.stdin)
     except json.JSONDecodeError as exc:
@@ -676,10 +912,39 @@ def cmd_configure(cfg: dict, roles: dict) -> int:
     if not isinstance(panelists, list) or not panelists:
         sys.exit('Expected {"panelists": [ ... ]} with at least one entry.')
 
+    errors = validate_panelists(cfg, roles, panelists)
+    if errors:
+        for e in errors:
+            print(f"  {e}", file=sys.stderr)
+        sys.exit(f"{len(errors)} problem(s); config not written.")
+
+    if len(panelists) > 8:
+        print(f"NOTE: {len(panelists)} panelists. Beyond ~5 the synthesis gets "
+              f"noisy and cost scales linearly.", file=sys.stderr)
+
+    write_panel(cfg, panelists)
+    print(f"Wrote {len(panelists)} panelists to {CONFIG_PATH}:")
+    for pl in panelists:
+        print(f"  {pl['name']:<12} {pl.get('role','custom'):<16} {pl['model']}")
+    return 0
+
+
+def write_panel(cfg: dict, panelists: list) -> None:
+    cfg["panelists"] = panelists
+    save_json(CONFIG_PATH, cfg)
+
+
+def validate_panelists(cfg: dict, roles: dict, panelists: list) -> list:
+    """Pure: returns a list of problems, writes nothing, never exits.
+
+    Shared by --configure and the web UI so the two cannot drift. It must stay
+    side-effect free -- it runs inside HTTP handler threads, where sys.exit()
+    would kill the connection instead of returning an error to the caller.
+    """
     known_providers = set(cfg.get("providers", {}))
-    known_roles = set(roles["roles"])
-    seen_names: set[str] = set()
-    errors: list[str] = []
+    known_roles = set(roles.get("roles", {}))
+    seen_names: set = set()
+    errors: list = []
 
     for i, p in enumerate(panelists):
         if not isinstance(p, dict):
@@ -700,21 +965,7 @@ def cmd_configure(cfg: dict, roles: dict) -> int:
         if role and role not in known_roles and not p.get("lens"):
             errors.append(f"{name}: unknown role '{role}' "
                           f"(known: {', '.join(sorted(known_roles))})")
-    if errors:
-        for e in errors:
-            print(f"  {e}", file=sys.stderr)
-        sys.exit(f"{len(errors)} problem(s); config not written.")
-
-    if len(panelists) > 8:
-        print(f"NOTE: {len(panelists)} panelists. Beyond ~5 the synthesis gets noisy "
-              f"and cost scales linearly.", file=sys.stderr)
-
-    cfg["panelists"] = panelists
-    save_json(CONFIG_PATH, cfg)
-    print(f"Wrote {len(panelists)} panelists to {CONFIG_PATH}:")
-    for p in panelists:
-        print(f"  {p['name']:<12} {p.get('role','custom'):<16} {p['model']}")
-    return 0
+    return errors
 
 
 def cmd_check(cfg: dict, roles: dict, creds: dict, panel: list[dict],
@@ -780,6 +1031,10 @@ def main() -> int:
     ap.add_argument("--diagnose-key", metavar="PROVIDER",
                     help="explain why a key does or does not resolve")
     ap.add_argument("--check", action="store_true")
+    ap.add_argument("--serve", action="store_true",
+                    help="open the local configuration UI in a browser")
+    ap.add_argument("--port", type=int, default=8787,
+                    help="port for --serve (default 8787)")
     ap.add_argument("--health", action="store_true",
                     help="reliability per panelist + swap recommendations")
     ap.add_argument("--suggest-swap", metavar="PANELIST",
@@ -807,6 +1062,8 @@ def main() -> int:
         return cmd_list_models(cfg, creds, args.provider, timeout)
     if args.show:
         return cmd_show(cfg, roles, creds)
+    if args.serve:
+        return cmd_serve(cfg, roles, creds, args.port, timeout)
     if args.health:
         return cmd_health(cfg, creds, timeout)
     if args.suggest_swap:

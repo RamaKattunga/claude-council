@@ -95,5 +95,38 @@ class CouncilTests(unittest.TestCase):
             self.assertIn(role, r.stdout)
 
 
+class ValidatorContractTests(unittest.TestCase):
+    """validate_panelists runs inside HTTP handler threads, so it must be pure:
+    return problems, write nothing, never call sys.exit. A previous refactor
+    left the write-and-exit tail inside it, which killed the web UI's
+    connection instead of returning an error. The CLI tests all still passed,
+    so this contract needs its own test."""
+
+    def setUp(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("council", SCRIPT)
+        self.m = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.m)
+        self.cfg = {"providers": {"nvidia": {"base_url": "x", "api_key_env": "K"}},
+                    "panelists": [{"name": "keep", "provider": "nvidia",
+                                   "model": "m", "role": "security"}]}
+        self.roles = {"roles": {"security": {"label": "s", "lens": "l"}}}
+
+    def test_returns_errors_without_exiting(self):
+        bad = [{"name": "a", "provider": "ghost", "model": "m", "role": "ghost"}]
+        errs = self.m.validate_panelists(self.cfg, self.roles, bad)   # must not raise
+        self.assertEqual(len(errs), 2)
+
+    def test_does_not_mutate_config(self):
+        good = [{"name": "new", "provider": "nvidia", "model": "m2",
+                 "role": "security"}]
+        self.assertEqual(self.m.validate_panelists(self.cfg, self.roles, good), [])
+        self.assertEqual(self.cfg["panelists"][0]["name"], "keep")   # untouched
+
+    def test_valid_panel_returns_empty_list(self):
+        good = [{"name": "a", "provider": "nvidia", "model": "m", "role": "security"}]
+        self.assertEqual(self.m.validate_panelists(self.cfg, self.roles, good), [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

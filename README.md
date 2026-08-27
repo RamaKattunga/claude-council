@@ -34,6 +34,21 @@ Requires Python 3.9+. **No dependencies** — standard library only, no venv, no
 | `/council:review [target]` | Run a review and synthesize the results |
 | `/council:health` | Reliability report, with swap recommendations for weak panelists |
 
+## Configuration UI
+
+```bash
+python3 scripts/council.py --serve
+```
+
+Opens a local page for key entry, live model probing, panelist and role selection, and a health
+view. Everything the CLI does, without hand-writing JSON.
+
+Security posture, since this opens a socket: bound to `127.0.0.1` only (never `0.0.0.0`), a random
+token is required on every API call and changes each run, the `Host` header is validated to defeat
+DNS rebinding, the page declares a CSP and loads no external resources, and the server stops after
+30 minutes idle. Keys can be submitted but are never sent back — only fingerprints leave the
+server.
+
 ## Keys
 
 Resolution order: **environment variable → macOS Keychain → `credentials.json` (0600)**.
