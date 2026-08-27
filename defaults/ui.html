@@ -99,10 +99,34 @@ let S={panelists:[],roles:{},providers:{}},LIVE=[];
 const $=s=>document.querySelector(s), esc=s=>String(s).replace(/[<>&"]/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;'}[c]));
 function toast(m){const t=$('#toast');t.textContent=m;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),2600)}
 async function api(p,opt={}){
-  const r=await fetch(p,{...opt,headers:{'X-Council-Token':T,'Content-Type':'application/json',...(opt.headers||{})}});
+  let r;
+  try{
+    r=await fetch(p,{...opt,headers:{'X-Council-Token':T,'Content-Type':'application/json',...(opt.headers||{})}});
+  }catch(e){
+    // A network-level failure means the process is gone, not that the request
+    // was rejected. "Failed to fetch" on its own sends people hunting for a
+    // bug in their input.
+    banner('The council server is not running. It was stopped or timed out. '
+      +'Restart it with <code>council.py --serve</code>, then reload this page. '
+      +'Nothing you entered was saved.');
+    throw new Error('server not reachable');
+  }
   const j=await r.json().catch(()=>({error:'bad response'}));
+  if(r.status===403){
+    banner('This page&rsquo;s token is stale &mdash; the server has restarted since it loaded. '
+      +'Open the new URL printed by <code>--serve</code>.');
+    throw new Error('stale token');
+  }
   if(!r.ok)throw new Error(j.error||('HTTP '+r.status));
   return j;
+}
+function banner(html){
+  let b=document.getElementById('banner');
+  if(!b){b=document.createElement('div');b.id='banner';
+    b.style.cssText='background:var(--card);border:1px solid var(--bad);border-left-width:3px;'
+      +'border-radius:8px;padding:14px 16px;margin-bottom:18px;font-size:13.5px;line-height:1.55';
+    document.querySelector('.wrap').insertBefore(b,document.querySelector('section'));}
+  b.innerHTML=html;
 }
 function drawKeys(){
   $('#keys tbody').innerHTML=Object.entries(S.providers).map(([n,p])=>{
