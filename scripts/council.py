@@ -894,9 +894,13 @@ def cmd_serve(cfg: dict, roles: dict, creds: dict, port: int,
 
     httpd = http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler)
     url = f"http://127.0.0.1:{httpd.server_port}/?t={token}"
-    print(f"Council configuration UI: {url}")
-    print("Bound to 127.0.0.1 only. The token is required and changes every run.")
-    print(f"Auto-stops after {IDLE_LIMIT // 60} min idle. Ctrl-C to stop now.")
+    # flush: stdout is block-buffered when redirected, and the URL below is
+    # the only way to get the token. Without this it never reaches a log file.
+    print(f"Council configuration UI: {url}", flush=True)
+    print("Bound to 127.0.0.1 only. The token is required and changes every run.",
+          flush=True)
+    print(f"Auto-stops after {IDLE_LIMIT // 60} min idle. Ctrl-C to stop now.",
+          flush=True)
 
     def watchdog():
         while True:

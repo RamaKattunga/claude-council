@@ -2,7 +2,20 @@
   "name": "claude-council",
   "version": "0.1.0",
   "description": "Cross-vendor code review. Fans a prompt out to several OpenAI-compatible models in parallel, each with a distinct review role, then synthesizes consensus and disagreement. Works with any OpenAI-compatible endpoint including NVIDIA NIM, so panelists are not limited to Codex and Gemini CLIs.",
-  "author": {"name": "Rama Kattunga"},
+  "author": {
+    "name": "Rama Kattunga"
+  },
   "license": "MIT",
-  "keywords": ["code-review", "multi-model", "consensus", "nvidia-nim", "second-opinion"]
+  "keywords": [
+    "code-review",
+    "multi-model",
+    "consensus",
+    "nvidia-nim",
+    "second-opinion",
+    "cross-vendor",
+    "openai-compatible",
+    "claude-code"
+  ],
+  "homepage": "https://github.com/RamaKattunga/claude-council",
+  "repository": "https://github.com/RamaKattunga/claude-council"
 }
