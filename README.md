@@ -224,6 +224,19 @@ The tool refuses to dispatch a prompt containing anything that looks like a cred
 (`--allow-secrets` overrides). The scanner is deliberately biased toward false positives: a
 spurious warning costs you one flag, a missed key costs a rotation across every vendor.
 
+**Known limits, stated so nobody mistakes the scan for a guarantee.** It works line by line
+on literal text, so it does not catch:
+
+- secrets that are base64-encoded or otherwise wrapped
+- secrets split across lines by string concatenation
+- a `-----BEGIN PRIVATE KEY-----` header broken across a newline
+- high-entropy strings with no recognisable prefix or assignment
+- anything sensitive that does not look like a credential
+
+Chasing the first three is an arms race against your own codebase and not worth the false
+positive rate. They are listed because a limit you know about is manageable and one you
+assume away is not.
+
 It is a backstop, not a boundary. It will not catch proprietary algorithms, customer data,
 unreleased strategy, or anything else that is sensitive without looking like a secret.
 **Scoping the diff is the operator's job.** Do not point this at code you are not free to

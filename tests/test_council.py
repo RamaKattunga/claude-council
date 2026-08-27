@@ -136,6 +136,27 @@ class SecretPreflightTests(unittest.TestCase):
         self.assertNotIn(secret, shown)
         self.assertLess(len(shown), len(secret))
 
+    def test_catches_pii_not_just_credentials(self):
+        """A review tool meets card numbers and SSNs in test fixtures and sample
+        rows. They are not credentials, but they are equally unrecallable once
+        fanned out to five providers."""
+        self.assertEqual(self.m.scan_for_secrets("4111 1111 1111 1111")[0][1],
+                         "payment card number")
+        self.assertEqual(self.m.scan_for_secrets("SSN 123-45-6789")[0][1],
+                         "US SSN")
+        self.assertEqual(
+            self.m.scan_for_secrets("Bearer abcdefghijklmnopqrstuvwxyz123456")[0][1],
+            "bearer token")
+
+    def test_luhn_keeps_long_digit_runs_from_tripping_the_card_rule(self):
+        """Without Luhn, every order id, timestamp and account number is a card
+        number and the scan becomes noise people disable."""
+        for benign in ("order_id = 1234567890123456",
+                       "timestamp 20260826120000123",
+                       "seq 9999999999999999"):
+            self.assertEqual(self.m.scan_for_secrets(benign), [],
+                             f"false positive: {benign}")
+
     def test_ordinary_code_is_not_flagged(self):
         code = ("def add(a, b):\n    return a + b\n"
                 "# token = the auth token is validated upstream\n"

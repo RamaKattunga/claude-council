@@ -185,10 +185,45 @@ SECRET_PATTERNS = [
     ("JWT", re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}")),
     ("connection string with password",
      re.compile(r"\b\w+://[^\s:@/]+:[^\s:@/]+@")),
+    ("bearer token", re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{16,}")),
     ("assigned secret",
      re.compile(r"(?i)\b(api[_-]?key|secret|password|passwd|token|auth)\b"
                 r"\s*[:=]\s*[\"']?[A-Za-z0-9_\-/+]{12,}")),
 ]
+
+
+def _luhn_ok(digits: str) -> bool:
+    """Luhn check. Without it, any 13-19 digit run trips the card rule -- and
+    order ids, timestamps and account numbers are all long digit runs."""
+    total, alt = 0, False
+    for ch in reversed(digits):
+        d = ord(ch) - 48
+        if alt:
+            d *= 2
+            if d > 9:
+                d -= 9
+        total += d
+        alt = not alt
+    return total % 10 == 0
+
+
+_CARD_RE = re.compile(r"\b(?:\d[ -]?){12,18}\d\b")
+_SSN_RE = re.compile(r"\b\d{3}-\d{2}-\d{4}\b")
+
+
+def _scan_pii(line: str) -> tuple | None:
+    """Card numbers and US SSNs. Not credentials, but equally unrecallable once
+    fanned out to five providers, and a review tool meets them in test
+    fixtures and sample rows."""
+    m = _CARD_RE.search(line)
+    if m:
+        digits = re.sub(r"[ -]", "", m.group(0))
+        if 13 <= len(digits) <= 19 and _luhn_ok(digits):
+            return ("payment card number", m.group(0))
+    m = _SSN_RE.search(line)
+    if m:
+        return ("US SSN", m.group(0))
+    return None
 
 
 def scan_for_secrets(text: str) -> list:
@@ -203,6 +238,12 @@ def scan_for_secrets(text: str) -> list:
     """
     findings = []
     for n, line in enumerate(text.splitlines(), 1):
+        hit = _scan_pii(line)
+        if hit:
+            label, frag = hit
+            shown = frag[:6] + "…" + frag[-2:] if len(frag) > 12 else "…"
+            findings.append((n, label, shown))
+            continue
         for label, pat in SECRET_PATTERNS:
             m = pat.search(line)
             if m:
