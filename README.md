@@ -52,7 +52,7 @@ category of risk disappears — along with the code that manages it.
 ## Install
 
 ```
-/plugin marketplace add RamaKattunga/claude-council
+/plugin marketplace add swingsystems/claude-council
 /plugin install claude-council@claude-council-marketplace
 ```
 
