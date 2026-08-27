@@ -169,6 +169,46 @@ def _request(url: str, api_key: str, timeout: int, payload: dict | None = None) 
 
 # ---------------------------------------------------------------- panel wiring
 
+def _post_chat(url: str, api_key: str, payload: dict, timeout: int) -> dict:
+    """POST a chat completion, adapting once to provider parameter quirks.
+
+    Providers disagree about parameter names and which values are allowed.
+    OpenAI's newer models reject `max_tokens` in favour of
+    `max_completion_tokens`, and reject a non-default `temperature` outright.
+    Every NVIDIA-hosted model accepts the older spelling, so this only bites
+    once an OpenAI-direct panelist is seated -- but when it does, the request
+    fails 100% of the time and the error is easy to mistake for a bad key.
+
+    Rather than making the user hand-tune per-model config, adapt once from
+    the provider's own structured error and retry. A second failure is real
+    and propagates.
+    """
+    try:
+        return _request(url, api_key, timeout, payload)
+    except urllib.error.HTTPError as exc:
+        if exc.code != 400:
+            raise
+        body = exc.read().decode(errors="replace")
+        try:
+            err = json.loads(body).get("error", {})
+        except json.JSONDecodeError:
+            raise urllib.error.HTTPError(url, exc.code, body, exc.headers, None)
+
+        param, code = err.get("param"), err.get("code")
+        message = err.get("message", "")
+        if code not in ("unsupported_parameter", "unsupported_value"):
+            raise urllib.error.HTTPError(url, exc.code, body, exc.headers, None)
+        if not param or param not in payload:
+            raise urllib.error.HTTPError(url, exc.code, body, exc.headers, None)
+
+        retry = dict(payload)
+        if param == "max_tokens" and "max_completion_tokens" in message:
+            retry["max_completion_tokens"] = retry.pop("max_tokens")
+        else:
+            retry.pop(param, None)     # value not allowed: fall back to default
+        return _request(url, api_key, timeout, retry)
+
+
 def provider_of(cfg: dict, panelist: dict) -> dict:
     name = panelist.get("provider")
     provider = cfg.get("providers", {}).get(name)
@@ -292,7 +332,7 @@ def ask(cfg: dict, roles: dict, creds: dict, panelist: dict,
 
     url = provider["base_url"].rstrip("/") + "/chat/completions"
     try:
-        data = _request(url, key, panelist.get("timeout") or timeout, payload)
+        data = _post_chat(url, key, payload, panelist.get("timeout") or timeout)
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode(errors="replace")[:400]
         hint = ""
