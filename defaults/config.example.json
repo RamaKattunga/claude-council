@@ -33,6 +33,15 @@
       "timeout": 300
     },
     {
+      "name": "deepseek",
+      "provider": "nvidia",
+      "model": "deepseek-ai/deepseek-v4-pro-0813",
+      "role": "data-integrity",
+      "enabled": true,
+      "max_tokens": 8192,
+      "timeout": 300
+    },
+    {
       "name": "kimi",
       "provider": "nvidia",
       "model": "moonshotai/kimi-k3",
